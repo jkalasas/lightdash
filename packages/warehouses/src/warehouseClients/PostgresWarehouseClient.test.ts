@@ -27,8 +27,9 @@ vi.mock('pg', async () => ({
                     null,
                     {
                         query: vi.fn((arg: unknown) => {
-                            // Session statements (SET statement_timeout / timezone)
-                            // are issued as plain string queries and must return a
+                            // Transaction + session statements (BEGIN/COMMIT/
+                            // ROLLBACK, SET statement_timeout / timezone) are
+                            // issued as plain string queries and must return a
                             // thenable, not a stream.
                             if (typeof arg === 'string') {
                                 return Promise.resolve({
@@ -183,7 +184,11 @@ describe('PostgresWarehouseClient statement timeout', () => {
         await warehouse.runQuery('select 1');
         const sessionStatement = queryMock.mock.calls
             .map((call) => call[0])
-            .find((arg) => typeof arg === 'string');
+            .find(
+                (arg) =>
+                    typeof arg === 'string' &&
+                    arg.includes('SET statement_timeout'),
+            );
         expect(sessionStatement).toContain('SET statement_timeout = 540000');
     });
 
@@ -197,8 +202,68 @@ describe('PostgresWarehouseClient statement timeout', () => {
         await warehouse.runQuery('select 1');
         const sessionStatement = queryMock.mock.calls
             .map((call) => call[0])
-            .find((arg) => typeof arg === 'string');
+            .find(
+                (arg) =>
+                    typeof arg === 'string' &&
+                    arg.includes('SET statement_timeout'),
+            );
         expect(sessionStatement).toContain('SET statement_timeout = 120000');
+    });
+
+    it('wraps the cursor stream in BEGIN...COMMIT', async () => {
+        const queryMock = respondingQueryMock();
+        mockPoolWithQuery(queryMock);
+        const warehouse = new PostgresWarehouseClient(credentials);
+        await warehouse.runQuery('select 1');
+
+        const stringQueries = queryMock.mock.calls
+            .map((call) => call[0])
+            .filter((arg): arg is string => typeof arg === 'string');
+
+        expect(stringQueries[0]).toBe('BEGIN');
+        expect(stringQueries[1]).toContain('SET statement_timeout');
+        expect(stringQueries.at(-1)).toBe('COMMIT');
+        expect(stringQueries).not.toContain('ROLLBACK');
+
+        const streamCallIndex = queryMock.mock.calls.findIndex(
+            (call) => typeof call[0] !== 'string',
+        );
+        const beginIndex = queryMock.mock.calls.findIndex(
+            (call) => call[0] === 'BEGIN',
+        );
+        const commitIndex = queryMock.mock.calls.findIndex(
+            (call) => call[0] === 'COMMIT',
+        );
+        expect(beginIndex).toBeGreaterThanOrEqual(0);
+        expect(streamCallIndex).toBeGreaterThan(beginIndex);
+        expect(commitIndex).toBeGreaterThan(streamCallIndex);
+    });
+
+    it('rolls back when the cursor stream fails', async () => {
+        const queryMock = vi.fn((arg: unknown) => {
+            if (typeof arg === 'string') {
+                return Promise.resolve({ rows: [], fields: [] });
+            }
+            const stream = new PassThrough();
+            setTimeout(() => {
+                stream.destroy(new Error('portal "C_1" does not exist'));
+            }, 10);
+            return stream;
+        });
+        mockPoolWithQuery(queryMock);
+        const warehouse = new PostgresWarehouseClient(credentials);
+
+        await expect(warehouse.runQuery('select 1')).rejects.toThrow(
+            'portal "C_1" does not exist',
+        );
+
+        const stringQueries = queryMock.mock.calls
+            .map((call) => call[0])
+            .filter((arg): arg is string => typeof arg === 'string');
+
+        expect(stringQueries[0]).toBe('BEGIN');
+        expect(stringQueries).toContain('ROLLBACK');
+        expect(stringQueries).not.toContain('COMMIT');
     });
 
     it('rejects with a timeout error when a query stalls past the client backstop', async () => {
@@ -220,6 +285,11 @@ describe('PostgresWarehouseClient statement timeout', () => {
             // 9-minute statement_timeout + 30s client buffer = 570s
             vi.advanceTimersByTimeAsync(570 * 1000 + 1000),
         ]);
+
+        const stringQueries = queryMock.mock.calls
+            .map((call) => call[0])
+            .filter((arg): arg is string => typeof arg === 'string');
+        expect(stringQueries).toContain('ROLLBACK');
     });
 });
 

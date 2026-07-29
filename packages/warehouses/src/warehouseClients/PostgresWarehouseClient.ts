@@ -283,6 +283,8 @@ export class PostgresClient<
     ): Promise<void> {
         let pool: pg.Pool | undefined;
         let closeClient: (() => void) | undefined;
+        let poolClient: pg.PoolClient | undefined;
+        let transactionOpen = false;
         let activeStream: QueryStream | undefined;
         let queryTimeout: ReturnType<typeof setTimeout> | undefined;
 
@@ -346,6 +348,7 @@ export class PostgresClient<
                     reject(new Error('client undefined'));
                     return;
                 }
+                poolClient = client;
                 reportPhase?.('connect', performance.now() - connectStart);
 
                 client.on('error', (e) => {
@@ -429,7 +432,9 @@ export class PostgresClient<
                     });
 
                     // Wait for writable to finish processing all async callbacks
-                    // (not 'end' on readable - async write callbacks may still be in flight)
+                    // (not 'end' on readable - async write callbacks may still be in flight).
+                    // COMMIT keeps the pg-cursor portal on one backend under
+                    // transaction-mode poolers (pgdog/pgbouncer).
                     writable.on('finish', () => {
                         if (fetchStart === undefined) {
                             reportPhase?.(
@@ -443,7 +448,15 @@ export class PostgresClient<
                                 performance.now() - fetchStart,
                             );
                         }
-                        resolve();
+                        client
+                            .query('COMMIT')
+                            .then(() => {
+                                transactionOpen = false;
+                                resolve();
+                            })
+                            .catch((commitError) => {
+                                reject(commitError);
+                            });
                     });
                     writable.on('error', (err2) => {
                         reject(err2);
@@ -456,13 +469,21 @@ export class PostgresClient<
                     });
                 };
 
-                // Always enforce a server-side statement timeout — the pool's
-                // query_timeout is ineffective on the cursor path. Issued as
-                // its own single statement (followed by the optional timezone)
-                // to stay portable across Postgres and Redshift.
+                // Open an explicit transaction before session setup and the
+                // cursor stream. pg-cursor uses a named portal across batches;
+                // transaction-mode poolers drop portals between implicit
+                // transactions, so BEGIN...COMMIT pins one backend for the
+                // whole stream. statement_timeout is also set inside the txn
+                // so it applies on the same backend as the cursor.
                 const sessionStart = performance.now();
                 client
-                    .query(`SET statement_timeout = ${statementTimeoutMs}`)
+                    .query('BEGIN')
+                    .then(() => {
+                        transactionOpen = true;
+                        return client.query(
+                            `SET statement_timeout = ${statementTimeoutMs}`,
+                        );
+                    })
                     .then(() => {
                         if (options?.timezone) {
                             console.debug(
@@ -497,6 +518,19 @@ export class PostgresClient<
                 if (queryTimeout) {
                     clearTimeout(queryTimeout);
                 }
+
+                if (transactionOpen && poolClient) {
+                    try {
+                        await poolClient.query('ROLLBACK');
+                    } catch (rollbackError) {
+                        console.warn(
+                            'Error rolling back postgres transaction:',
+                            rollbackError,
+                        );
+                    }
+                    transactionOpen = false;
+                }
+
                 // Release the client first, then end the pool
                 if (closeClient) {
                     try {
