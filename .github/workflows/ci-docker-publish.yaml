@@ -1,0 +1,81 @@
+name: CI Docker Publish
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel (latest or dev)
+        required: true
+        default: latest
+        type: choice
+        options:
+          - latest
+          - dev
+
+jobs:
+  publish-docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 10
+
+      - name: Detect release channel
+        id: channel
+        run: |
+          if [[ -n "${{ github.event.inputs.channel }}" ]]; then
+            CHANNEL="${{ github.event.inputs.channel }}"
+          else
+            BRANCH="${{ github.ref_name }}"
+
+            if [[ "$BRANCH" == "main" ]]; then
+              CHANNEL="latest"
+            else
+              echo "Unknown branch: $BRANCH"
+              exit 1
+            fi
+          fi
+
+          echo "channel=$CHANNEL" >> $GITHUB_OUTPUT
+          echo "Detected channel: $CHANNEL"
+
+      - name: Extract version and generate tags
+        id: meta
+        run: |
+          SHA_SHORT=$(git rev-parse --short HEAD)
+          CHANNEL="${{ steps.channel.outputs.channel }}"
+          REPO_PATH="${{ github.repository }}"
+          APP_VERSION=$(node -p "require('./package.json').version")
+
+          echo "tag=git.guestpulse.dev/$REPO_PATH:${CHANNEL}" >> $GITHUB_OUTPUT
+          echo "sha_tag=git.guestpulse.dev/$REPO_PATH:${CHANNEL}-${SHA_SHORT}" >> $GITHUB_OUTPUT
+          echo "app_version=${APP_VERSION}-${CHANNEL}-${SHA_SHORT}" >> $GITHUB_OUTPUT
+
+      - name: Login to Gitea Container Registry
+        run: echo "${{ secrets.PACKAGES_PASSWORD }}" | docker login git.guestpulse.dev -u "${{ secrets.PACKAGES_USER }}" --password-stdin
+
+      - name: Build and push Docker image
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          SHA_TAG="${{ steps.meta.outputs.sha_tag }}"
+
+          docker build \
+            -f ./dockerfile \
+            -t "$TAG" \
+            -t "$SHA_TAG" \
+            .
+
+          docker push "$TAG"
+          docker push "$SHA_TAG"
+
+      - name: Verify image pushed
+        run: |
+          echo "Image pushed with tags:"
+          echo "  ${{ steps.meta.outputs.tag }}"
+          echo "  ${{ steps.meta.outputs.sha_tag }}"
+          echo "App version: ${{ steps.meta.outputs.app_version }}"
