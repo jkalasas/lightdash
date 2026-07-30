@@ -150,6 +150,52 @@ const DEFAULT_STATEMENT_TIMEOUT_MS = 1000 * 60 * 9; // 9 minutes
 // never reports back (e.g. a dead SSH tunnel socket).
 const CLIENT_STATEMENT_TIMEOUT_BUFFER_MS = 1000 * 30; // 30 seconds
 
+const CLEANUP_ROLLBACK_TIMEOUT_MS = 1500;
+const CLEANUP_POOL_END_TIMEOUT_MS = 2000;
+
+const withTimeout = async <T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    label: string,
+): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<T>((_, reject) => {
+                timer = setTimeout(() => {
+                    reject(
+                        new Error(`${label} timed out after ${timeoutMs}ms`),
+                    );
+                }, timeoutMs);
+            }),
+        ]);
+    } finally {
+        if (timer) {
+            clearTimeout(timer);
+        }
+    }
+};
+
+const forceDestroyClient = (client: pg.PoolClient | undefined): void => {
+    if (!client) {
+        return;
+    }
+    const maybeClient = client as pg.PoolClient & {
+        connection?: { stream?: { destroy: (err?: Error) => void } };
+        end?: () => Promise<void>;
+    };
+    if (maybeClient.connection?.stream?.destroy) {
+        maybeClient.connection.stream.destroy(
+            new Error('postgres warehouse client force-destroyed'),
+        );
+        return;
+    }
+    if (maybeClient.end) {
+        void maybeClient.end().catch(() => undefined);
+    }
+};
+
 const convertDataTypeIdToDimensionType = (
     dataTypeId: number,
 ): DimensionType => {
@@ -282,9 +328,10 @@ export class PostgresClient<
         },
     ): Promise<void> {
         let pool: pg.Pool | undefined;
-        let closeClient: (() => void) | undefined;
+        let closeClient: ((err?: Error) => void) | undefined;
         let poolClient: pg.PoolClient | undefined;
         let transactionOpen = false;
+        let cleanSuccess = false;
         let activeStream: QueryStream | undefined;
         let queryTimeout: ReturnType<typeof setTimeout> | undefined;
 
@@ -452,6 +499,7 @@ export class PostgresClient<
                             .query('COMMIT')
                             .then(() => {
                                 transactionOpen = false;
+                                cleanSuccess = true;
                                 resolve();
                             })
                             .catch((commitError) => {
@@ -459,12 +507,14 @@ export class PostgresClient<
                             });
                     });
                     writable.on('error', (err2) => {
+                        activeStream?.destroy(err2);
                         reject(err2);
                     });
                     activeStream.on('error', (err2) => {
                         reject(err2);
                     });
                     activeStream.pipe(writable).on('error', (err2) => {
+                        activeStream?.destroy(err2);
                         reject(err2);
                     });
                 };
@@ -519,10 +569,34 @@ export class PostgresClient<
                     clearTimeout(queryTimeout);
                 }
 
+                let rollbackOutcome:
+                    | 'success'
+                    | 'error'
+                    | 'timeout'
+                    | 'skipped' = 'skipped';
+                let releaseMode: 'soft' | 'destroy' | 'none' = 'none';
+                let poolEndOutcome:
+                    | 'success'
+                    | 'error'
+                    | 'timeout'
+                    | 'skipped' = 'skipped';
+                let discardClient = !cleanSuccess;
+
                 if (transactionOpen && poolClient) {
                     try {
-                        await poolClient.query('ROLLBACK');
+                        await withTimeout(
+                            poolClient.query('ROLLBACK'),
+                            CLEANUP_ROLLBACK_TIMEOUT_MS,
+                            'postgres ROLLBACK',
+                        );
+                        rollbackOutcome = 'success';
                     } catch (rollbackError) {
+                        discardClient = true;
+                        rollbackOutcome =
+                            rollbackError instanceof Error &&
+                            rollbackError.message.includes('timed out')
+                                ? 'timeout'
+                                : 'error';
                         console.warn(
                             'Error rolling back postgres transaction:',
                             rollbackError,
@@ -531,21 +605,49 @@ export class PostgresClient<
                     transactionOpen = false;
                 }
 
-                // Release the client first, then end the pool
                 if (closeClient) {
                     try {
-                        closeClient();
+                        if (discardClient) {
+                            releaseMode = 'destroy';
+                            closeClient(
+                                new Error(
+                                    'postgres warehouse stream failed; discarding client',
+                                ),
+                            );
+                        } else {
+                            releaseMode = 'soft';
+                            closeClient();
+                        }
                     } catch (releaseError) {
+                        discardClient = true;
                         console.warn('Error releasing client:', releaseError);
+                        forceDestroyClient(poolClient);
                     }
                 }
 
                 if (pool) {
                     try {
-                        await pool.end();
+                        await withTimeout(
+                            pool.end(),
+                            CLEANUP_POOL_END_TIMEOUT_MS,
+                            'postgres pool.end',
+                        );
+                        poolEndOutcome = 'success';
                     } catch (poolError) {
+                        poolEndOutcome =
+                            poolError instanceof Error &&
+                            poolError.message.includes('timed out')
+                                ? 'timeout'
+                                : 'error';
                         console.info('Failed to end postgres pool:', poolError);
+                        forceDestroyClient(poolClient);
                     }
+                }
+
+                if (!cleanSuccess) {
+                    console.warn(
+                        `Postgres warehouse stream cleanup: rollback=${rollbackOutcome} release=${releaseMode} pool.end=${poolEndOutcome}`,
+                    );
                 }
             });
     }

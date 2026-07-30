@@ -146,15 +146,22 @@ describe('PostgresWarehouseClient', () => {
 
 describe('PostgresWarehouseClient statement timeout', () => {
     const mockPoolWithQuery = (queryMock: Mock) => {
+        const releaseMock = vi.fn();
+        const endMock = vi.fn(async () => undefined);
         (pg.Pool as unknown as Mock).mockImplementationOnce(function () {
             return {
                 connect: vi.fn((callback) => {
-                    callback(null, { query: queryMock, on: vi.fn() }, vi.fn());
+                    callback(
+                        null,
+                        { query: queryMock, on: vi.fn() },
+                        releaseMock,
+                    );
                 }),
-                end: vi.fn(async () => undefined),
+                end: endMock,
                 on: vi.fn(),
             };
         });
+        return { releaseMock, endMock };
     };
 
     const respondingQueryMock = () =>
@@ -173,6 +180,11 @@ describe('PostgresWarehouseClient statement timeout', () => {
             return stream;
         });
 
+    const stringQueriesFrom = (queryMock: Mock) =>
+        queryMock.mock.calls
+            .map((call) => call[0])
+            .filter((arg): arg is string => typeof arg === 'string');
+
     afterEach(() => {
         vi.useRealTimers();
     });
@@ -182,13 +194,9 @@ describe('PostgresWarehouseClient statement timeout', () => {
         mockPoolWithQuery(queryMock);
         const warehouse = new PostgresWarehouseClient(credentials);
         await warehouse.runQuery('select 1');
-        const sessionStatement = queryMock.mock.calls
-            .map((call) => call[0])
-            .find(
-                (arg) =>
-                    typeof arg === 'string' &&
-                    arg.includes('SET statement_timeout'),
-            );
+        const sessionStatement = stringQueriesFrom(queryMock).find((arg) =>
+            arg.includes('SET statement_timeout'),
+        );
         expect(sessionStatement).toContain('SET statement_timeout = 540000');
     });
 
@@ -200,25 +208,19 @@ describe('PostgresWarehouseClient statement timeout', () => {
             timeoutSeconds: 120,
         });
         await warehouse.runQuery('select 1');
-        const sessionStatement = queryMock.mock.calls
-            .map((call) => call[0])
-            .find(
-                (arg) =>
-                    typeof arg === 'string' &&
-                    arg.includes('SET statement_timeout'),
-            );
+        const sessionStatement = stringQueriesFrom(queryMock).find((arg) =>
+            arg.includes('SET statement_timeout'),
+        );
         expect(sessionStatement).toContain('SET statement_timeout = 120000');
     });
 
-    it('wraps the cursor stream in BEGIN...COMMIT', async () => {
+    it('wraps the cursor stream in BEGIN...COMMIT and soft-releases on success', async () => {
         const queryMock = respondingQueryMock();
-        mockPoolWithQuery(queryMock);
+        const { releaseMock, endMock } = mockPoolWithQuery(queryMock);
         const warehouse = new PostgresWarehouseClient(credentials);
         await warehouse.runQuery('select 1');
 
-        const stringQueries = queryMock.mock.calls
-            .map((call) => call[0])
-            .filter((arg): arg is string => typeof arg === 'string');
+        const stringQueries = stringQueriesFrom(queryMock);
 
         expect(stringQueries[0]).toBe('BEGIN');
         expect(stringQueries[1]).toContain('SET statement_timeout');
@@ -237,9 +239,13 @@ describe('PostgresWarehouseClient statement timeout', () => {
         expect(beginIndex).toBeGreaterThanOrEqual(0);
         expect(streamCallIndex).toBeGreaterThan(beginIndex);
         expect(commitIndex).toBeGreaterThan(streamCallIndex);
+
+        expect(releaseMock).toHaveBeenCalledTimes(1);
+        expect(releaseMock.mock.calls[0]).toEqual([]);
+        expect(endMock).toHaveBeenCalledTimes(1);
     });
 
-    it('rolls back when the cursor stream fails', async () => {
+    it('rolls back and destroys the client when the cursor stream fails', async () => {
         const queryMock = vi.fn((arg: unknown) => {
             if (typeof arg === 'string') {
                 return Promise.resolve({ rows: [], fields: [] });
@@ -250,20 +256,91 @@ describe('PostgresWarehouseClient statement timeout', () => {
             }, 10);
             return stream;
         });
-        mockPoolWithQuery(queryMock);
+        const { releaseMock, endMock } = mockPoolWithQuery(queryMock);
         const warehouse = new PostgresWarehouseClient(credentials);
 
         await expect(warehouse.runQuery('select 1')).rejects.toThrow(
             'portal "C_1" does not exist',
         );
 
-        const stringQueries = queryMock.mock.calls
-            .map((call) => call[0])
-            .filter((arg): arg is string => typeof arg === 'string');
+        const stringQueries = stringQueriesFrom(queryMock);
 
         expect(stringQueries[0]).toBe('BEGIN');
         expect(stringQueries).toContain('ROLLBACK');
         expect(stringQueries).not.toContain('COMMIT');
+
+        expect(releaseMock).toHaveBeenCalledTimes(1);
+        expect(releaseMock.mock.calls[0][0]).toBeInstanceOf(Error);
+        expect(releaseMock.mock.calls[0][0].message).toContain(
+            'discarding client',
+        );
+        expect(endMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('destroys the client when COMMIT fails after a successful stream', async () => {
+        const queryMock = vi.fn((arg: unknown) => {
+            if (typeof arg === 'string') {
+                if (arg === 'COMMIT') {
+                    return Promise.reject(new Error('commit failed'));
+                }
+                return Promise.resolve({ rows: [], fields: [] });
+            }
+            const stream = new PassThrough();
+            setTimeout(() => {
+                stream.emit('data', {
+                    row: expectedRow,
+                    fields: queryColumnsMock,
+                });
+                stream.end();
+            }, 10);
+            return stream;
+        });
+        const { releaseMock, endMock } = mockPoolWithQuery(queryMock);
+        const warehouse = new PostgresWarehouseClient(credentials);
+
+        await expect(warehouse.runQuery('select 1')).rejects.toThrow(
+            'commit failed',
+        );
+
+        expect(stringQueriesFrom(queryMock)).toContain('COMMIT');
+        expect(releaseMock).toHaveBeenCalledTimes(1);
+        expect(releaseMock.mock.calls[0][0]).toBeInstanceOf(Error);
+        expect(endMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('destroys the client and ends the pool when ROLLBACK hangs', async () => {
+        vi.useFakeTimers();
+        const queryMock = vi.fn((arg: unknown) => {
+            if (typeof arg === 'string') {
+                if (arg === 'ROLLBACK') {
+                    return new Promise(() => {});
+                }
+                return Promise.resolve({ rows: [], fields: [] });
+            }
+            const stream = new PassThrough();
+            setTimeout(() => {
+                stream.destroy(new Error('portal "C_1" does not exist'));
+            }, 10);
+            return stream;
+        });
+        const { releaseMock, endMock } = mockPoolWithQuery(queryMock);
+        const warehouse = new PostgresWarehouseClient(credentials);
+
+        const resultPromise = warehouse.runQuery('select 1');
+        await Promise.all([
+            expect(resultPromise).rejects.toThrow(
+                'portal "C_1" does not exist',
+            ),
+            (async () => {
+                await vi.advanceTimersByTimeAsync(20);
+                await vi.advanceTimersByTimeAsync(1500);
+            })(),
+        ]);
+
+        expect(stringQueriesFrom(queryMock)).toContain('ROLLBACK');
+        expect(releaseMock).toHaveBeenCalledTimes(1);
+        expect(releaseMock.mock.calls[0][0]).toBeInstanceOf(Error);
+        expect(endMock).toHaveBeenCalledTimes(1);
     });
 
     it('rejects with a timeout error when a query stalls past the client backstop', async () => {
@@ -272,24 +349,20 @@ describe('PostgresWarehouseClient statement timeout', () => {
             if (typeof arg === 'string') {
                 return Promise.resolve({ rows: [], fields: [] });
             }
-            // A stream that never emits or ends — simulates a stalled cursor.
             return new PassThrough();
         });
-        mockPoolWithQuery(queryMock);
+        const { releaseMock, endMock } = mockPoolWithQuery(queryMock);
         const warehouse = new PostgresWarehouseClient(credentials);
         const resultPromise = warehouse.runQuery('select pg_sleep(9999)');
-        // Attach the rejection handler before advancing the clock so the
-        // rejection is never momentarily unhandled.
         await Promise.all([
             expect(resultPromise).rejects.toThrow('Query timed out after 570s'),
-            // 9-minute statement_timeout + 30s client buffer = 570s
             vi.advanceTimersByTimeAsync(570 * 1000 + 1000),
         ]);
 
-        const stringQueries = queryMock.mock.calls
-            .map((call) => call[0])
-            .filter((arg): arg is string => typeof arg === 'string');
-        expect(stringQueries).toContain('ROLLBACK');
+        expect(stringQueriesFrom(queryMock)).toContain('ROLLBACK');
+        expect(releaseMock).toHaveBeenCalledTimes(1);
+        expect(releaseMock.mock.calls[0][0]).toBeInstanceOf(Error);
+        expect(endMock).toHaveBeenCalledTimes(1);
     });
 });
 
