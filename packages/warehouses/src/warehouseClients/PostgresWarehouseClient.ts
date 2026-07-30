@@ -153,6 +153,88 @@ const CLIENT_STATEMENT_TIMEOUT_BUFFER_MS = 1000 * 30; // 30 seconds
 const CLEANUP_ROLLBACK_TIMEOUT_MS = 1500;
 const CLEANUP_POOL_END_TIMEOUT_MS = 2000;
 
+// Each streamQuery opens its own TCP session. Cap process-wide concurrency so
+// dashboard fan-out cannot stampede a small pooler pool_size.
+const DEFAULT_MAX_CONCURRENT_POSTGRES_STREAMS = 10;
+
+const parseMaxConcurrentPostgresStreams = (): number => {
+    const raw = process.env.LIGHTDASH_POSTGRES_WAREHOUSE_MAX_CONCURRENT;
+    if (!raw) {
+        return DEFAULT_MAX_CONCURRENT_POSTGRES_STREAMS;
+    }
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || parsed < 1) {
+        return DEFAULT_MAX_CONCURRENT_POSTGRES_STREAMS;
+    }
+    return parsed;
+};
+
+class CountingSemaphore {
+    private active = 0;
+
+    private readonly waiters: Array<() => void> = [];
+
+    constructor(private limit: number) {}
+
+    setLimit(limit: number): void {
+        this.limit = Math.max(1, limit);
+        this.drainWaiters();
+    }
+
+    private drainWaiters(): void {
+        while (this.active < this.limit && this.waiters.length > 0) {
+            this.active += 1;
+            const next = this.waiters.shift();
+            next?.();
+        }
+    }
+
+    acquire(): Promise<void> {
+        if (this.active < this.limit) {
+            this.active += 1;
+            return Promise.resolve();
+        }
+        return new Promise<void>((resolve) => {
+            this.waiters.push(resolve);
+        });
+    }
+
+    release(): void {
+        this.active = Math.max(0, this.active - 1);
+        const next = this.waiters.shift();
+        if (next) {
+            this.active += 1;
+            next();
+        }
+    }
+
+    getActiveCount(): number {
+        return this.active;
+    }
+
+    getWaitingCount(): number {
+        return this.waiters.length;
+    }
+
+    reset(limit = parseMaxConcurrentPostgresStreams()): void {
+        this.limit = Math.max(1, limit);
+        this.active = 0;
+        this.waiters.length = 0;
+    }
+}
+
+const postgresStreamSemaphore = new CountingSemaphore(
+    parseMaxConcurrentPostgresStreams(),
+);
+
+/** @internal test hook for concurrency limiting */
+export const postgresStreamConcurrencyForTests = {
+    setLimit: (limit: number) => postgresStreamSemaphore.setLimit(limit),
+    reset: () => postgresStreamSemaphore.reset(),
+    getActiveCount: () => postgresStreamSemaphore.getActiveCount(),
+    getWaitingCount: () => postgresStreamSemaphore.getWaitingCount(),
+};
+
 const withTimeout = async <T>(
     promise: Promise<T>,
     timeoutMs: number,
@@ -315,6 +397,27 @@ export class PostgresClient<
     }
 
     async streamQuery(
+        sql: string,
+        streamCallback: (data: WarehouseResults) => void | Promise<void>,
+        options: {
+            values?: AnyType[];
+            tags?: Record<string, string>;
+            timezone?: string;
+            onPhaseTiming?: (
+                phase: WarehouseQueryPhase,
+                durationMs: number,
+            ) => void;
+        },
+    ): Promise<void> {
+        await postgresStreamSemaphore.acquire();
+        try {
+            return await this.runStreamQuery(sql, streamCallback, options);
+        } finally {
+            postgresStreamSemaphore.release();
+        }
+    }
+
+    private async runStreamQuery(
         sql: string,
         streamCallback: (data: WarehouseResults) => void | Promise<void>,
         options: {

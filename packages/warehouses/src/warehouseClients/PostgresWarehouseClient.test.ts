@@ -4,6 +4,7 @@ import { PassThrough } from 'stream';
 import type { Mock } from 'vitest';
 import {
     PostgresSqlBuilder,
+    postgresStreamConcurrencyForTests,
     PostgresWarehouseClient,
 } from './PostgresWarehouseClient';
 import {
@@ -363,6 +364,68 @@ describe('PostgresWarehouseClient statement timeout', () => {
         expect(releaseMock).toHaveBeenCalledTimes(1);
         expect(releaseMock.mock.calls[0][0]).toBeInstanceOf(Error);
         expect(endMock).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('PostgresWarehouseClient concurrency', () => {
+    afterEach(() => {
+        postgresStreamConcurrencyForTests.reset();
+        vi.useRealTimers();
+    });
+
+    it('queues streams so concurrent open pools never exceed the limit', async () => {
+        postgresStreamConcurrencyForTests.setLimit(1);
+
+        let inFlightPools = 0;
+        let maxInFlightPools = 0;
+
+        (pg.Pool as unknown as Mock).mockImplementation(function () {
+            inFlightPools += 1;
+            maxInFlightPools = Math.max(maxInFlightPools, inFlightPools);
+            return {
+                connect: vi.fn((callback) => {
+                    callback(
+                        null,
+                        {
+                            query: vi.fn((arg: unknown) => {
+                                if (typeof arg === 'string') {
+                                    return Promise.resolve({
+                                        rows: [],
+                                        fields: [],
+                                    });
+                                }
+                                const stream = new PassThrough();
+                                setTimeout(() => {
+                                    stream.emit('data', {
+                                        row: expectedRow,
+                                        fields: queryColumnsMock,
+                                    });
+                                    stream.end();
+                                }, 30);
+                                return stream;
+                            }),
+                            on: vi.fn(),
+                        },
+                        vi.fn(),
+                    );
+                }),
+                end: vi.fn(async () => {
+                    inFlightPools -= 1;
+                }),
+                on: vi.fn(),
+            };
+        });
+
+        const warehouse = new PostgresWarehouseClient(credentials);
+        await Promise.all([
+            warehouse.runQuery('select 1'),
+            warehouse.runQuery('select 2'),
+            warehouse.runQuery('select 3'),
+        ]);
+
+        expect(maxInFlightPools).toBe(1);
+        expect(postgresStreamConcurrencyForTests.getActiveCount()).toBe(0);
+        expect(postgresStreamConcurrencyForTests.getWaitingCount()).toBe(0);
     });
 });
 
