@@ -20,12 +20,10 @@ import { readFileSync } from 'fs';
 import path from 'path';
 import * as pg from 'pg';
 import { PoolConfig, QueryResult, types } from 'pg';
-import { Writable } from 'stream';
 import * as tls from 'tls';
 import { rootCertificates } from 'tls';
 import { normalizeUnicode } from '../utils/sql';
 import './pgProtocolGuard';
-import QueryStream from './PgQueryStream';
 import WarehouseBaseClient from './WarehouseBaseClient';
 import WarehouseBaseSqlBuilder from './WarehouseBaseSqlBuilder';
 
@@ -136,11 +134,9 @@ export const getPostgresTimestampDomain = (
 const { builtins } = pg.types;
 const POSTGRES_NAME_TOO_LONG_SQLSTATE = '42622';
 
-// Server-side ceiling for a single streamed query, bounded just under the
-// 10-min scheduler job timeout so a stalled cursor fails clearly instead of
-// hanging the whole job. The pool's `query_timeout` does not fire on the
-// cursor (pg-cursor) path, so the ceiling is enforced via `statement_timeout`
-// plus a client-side wall-clock backstop. Overridable per-connection via
+// Server-side ceiling for a single warehouse query, bounded just under the
+// 10-min scheduler job timeout. Enforced via `statement_timeout` plus a
+// client-side wall-clock backstop. Overridable per-connection via
 // `timeoutSeconds`.
 const DEFAULT_STATEMENT_TIMEOUT_MS = 1000 * 60 * 9; // 9 minutes
 
@@ -151,6 +147,10 @@ const DEFAULT_STATEMENT_TIMEOUT_MS = 1000 * 60 * 9; // 9 minutes
 const CLIENT_STATEMENT_TIMEOUT_BUFFER_MS = 1000 * 30; // 30 seconds
 
 const CLEANUP_POOL_END_TIMEOUT_MS = 2000;
+
+// node-pg buffers the full result for one-shot queries; we still invoke the
+// streamCallback in chunks so callers keep the existing streaming API.
+const STREAM_CALLBACK_CHUNK_SIZE = 500;
 
 // Each streamQuery opens its own TCP session. Cap process-wide concurrency so
 // dashboard fan-out cannot stampede a small pooler pool_size.
@@ -268,10 +268,8 @@ type DestroyableClient = pg.PoolClient & {
     end?: () => Promise<void>;
 };
 
-// Mid-stream extended-protocol errors leave the socket unusable. Graceful
-// client.end() / ROLLBACK can hang behind a stuck pg-cursor close, so we mark
-// the client unqueryable and hard-destroy the TCP stream. That is what lets
-// transaction-mode poolers (pgdog) release the pinned backend.
+// Hard-destroy the TCP stream when the connection is stuck (timeout, hung
+// release). Marks the client unqueryable so pool cleanup cannot hang.
 const forceDestroyClient = (client: pg.PoolClient | undefined): void => {
     if (!client) {
         return;
@@ -429,6 +427,12 @@ export class PostgresClient<
         }
     }
 
+    // Default path is a one-shot client.query (no named portals / pg-cursor).
+    // That keeps the connection in ReadyForQuery after success or error, which
+    // is what transaction-mode poolers (pgbouncer/pgdog) expect. The full
+    // result is buffered in Node memory; streamCallback is still invoked in
+    // chunks so callers keep the existing streaming API. Large unlimited
+    // exports may need a future path (COPY, session-mode pooler).
     private async runStreamQuery(
         sql: string,
         streamCallback: (data: WarehouseResults) => void | Promise<void>,
@@ -443,347 +447,193 @@ export class PostgresClient<
         },
     ): Promise<void> {
         let pool: pg.Pool | undefined;
-        let closeClient: ((err?: Error) => void) | undefined;
         let poolClient: pg.PoolClient | undefined;
-        let transactionOpen = false;
         let cleanSuccess = false;
-        let activeStream: QueryStream | undefined;
         let queryTimeout: ReturnType<typeof setTimeout> | undefined;
+        let timeoutError: WarehouseQueryError | undefined;
+        let noticeError: WarehouseQueryError | undefined;
 
         const reportPhase = options.onPhaseTiming;
 
-        // The pool's `query_timeout` does not fire on the cursor (pg-cursor)
-        // path, so we enforce the ceiling ourselves: a server-side
-        // `statement_timeout` (set below) plus this client-side wall-clock
-        // backstop that fires shortly after, in case the server never reports
-        // back (e.g. a stalled SSH tunnel socket).
         const statementTimeoutMs = this.credentials.timeoutSeconds
             ? this.credentials.timeoutSeconds * 1000
             : DEFAULT_STATEMENT_TIMEOUT_MS;
         const clientTimeoutMs =
             statementTimeoutMs + CLIENT_STATEMENT_TIMEOUT_BUFFER_MS;
 
-        return new Promise<void>((resolve, reject) => {
-            queryTimeout = setTimeout(() => {
-                const timeoutError = new WarehouseQueryError(
-                    `Query timed out after ${Math.round(
-                        clientTimeoutMs / 1000,
-                    )}s`,
-                );
-                activeStream?.destroy(timeoutError);
-                reject(timeoutError);
-            }, clientTimeoutMs);
-
+        try {
             pool = new pg.Pool({
                 ...this.config,
                 connectionTimeoutMillis: 30000,
                 query_timeout: this.credentials.timeoutSeconds
                     ? this.credentials.timeoutSeconds * 1000
-                    : 1000 * 60 * 5, // sets the default query timeout to 5 minutes
+                    : 1000 * 60 * 5,
             });
 
             pool.on('error', (err) => {
                 console.error(`Postgres pool error ${getErrorMessage(err)}`);
-                reject(err);
-            });
-
-            pool.on('connect', (_client: pg.PoolClient) => {
-                // On each new client initiated, need to register for error(this is a serious bug on pg, the client throw errors although it should not)
-                _client.on('error', (err: Error) => {
-                    console.error(
-                        `Postgres client connect error ${getErrorMessage(err)}`,
-                    );
-                    reject(err);
-                });
             });
 
             const connectStart = performance.now();
-            pool.connect((err, client, done) => {
-                // Store references so we can clean up properly
-                closeClient = done;
+            poolClient = await pool.connect();
+            reportPhase?.('connect', performance.now() - connectStart);
 
-                if (err) {
-                    reject(err);
-                    return;
-                }
-                if (!client) {
-                    reject(new Error('client undefined'));
-                    return;
-                }
-                poolClient = client;
-                reportPhase?.('connect', performance.now() - connectStart);
-
-                client.on('error', (e) => {
-                    console.error(
-                        `Postgres client error ${getErrorMessage(e)}`,
-                    );
-                    reject(e);
-                });
-
-                client.on('notice', (notice) => {
-                    const error = PostgresClient.getNoticeError(notice);
-                    if (!error) {
-                        return;
-                    }
-
-                    activeStream?.destroy(error);
-                    reject(error);
-                });
-
-                const runQuery = () => {
-                    const queryStart = performance.now();
-                    let fetchStart: number | undefined;
-                    // CodeQL: This will raise a security warning because user defined raw SQL is being passed into the database module.
-                    //         In this case this is exactly what we want to do. We're hitting the user's warehouse not the application's database.
-                    activeStream = client.query(
-                        // callback is not defined in types when using QueryStream
-                        // @ts-ignore
-                        new QueryStream(
-                            this.getSQLWithMetadata(sql, options?.tags),
-                            options?.values,
-                        ),
-                        // there is a bug in PG lib where callback is required when passing `query_timeout` to the Pool
-                        // see the code: https://github.com/brianc/node-postgres/blob/master/packages/pg/lib/client.js#L541-L542
-                        () => {},
-                        // typecast is necessary to fix the type issue described above
-                    ) as unknown as QueryStream;
-
-                    // Cache field conversion — result.fields is the same
-                    // array reference for every row in a query, so we only
-                    // need to convert it once.
-                    let cachedFields: Record<
-                        string,
-                        { type: DimensionType }
-                    > | null = null;
-
-                    const writable = new Writable({
-                        objectMode: true,
-                        async write(
-                            chunk: {
-                                row: AnyType;
-                                fields: QueryResult<AnyType>['fields'];
-                            },
-                            encoding,
-                            callback,
-                        ) {
-                            try {
-                                if (cachedFields === null) {
-                                    cachedFields =
-                                        PostgresClient.convertQueryResultFields(
-                                            chunk.fields,
-                                        );
-                                    reportPhase?.(
-                                        'query',
-                                        performance.now() - queryStart,
-                                    );
-                                    fetchStart = performance.now();
-                                }
-                                await streamCallback({
-                                    fields: cachedFields,
-                                    rows: [chunk.row],
-                                });
-                                callback();
-                            } catch (writeError) {
-                                if (writeError instanceof Error) {
-                                    callback(writeError);
-                                } else {
-                                    callback(new Error(String(writeError)));
-                                }
-                            }
-                        },
-                    });
-
-                    // Wait for writable to finish processing all async callbacks
-                    // (not 'end' on readable - async write callbacks may still be in flight).
-                    // COMMIT keeps the pg-cursor portal on one backend under
-                    // transaction-mode poolers (pgdog/pgbouncer).
-                    writable.on('finish', () => {
-                        if (fetchStart === undefined) {
-                            reportPhase?.(
-                                'query',
-                                performance.now() - queryStart,
-                            );
-                            reportPhase?.('fetch', 0);
-                        } else {
-                            reportPhase?.(
-                                'fetch',
-                                performance.now() - fetchStart,
-                            );
-                        }
-                        client
-                            .query('COMMIT')
-                            .then(() => {
-                                transactionOpen = false;
-                                cleanSuccess = true;
-                                resolve();
-                            })
-                            .catch((commitError) => {
-                                reject(commitError);
-                            });
-                    });
-                    writable.on('error', (err2) => {
-                        activeStream?.destroy(err2);
-                        reject(err2);
-                    });
-                    activeStream.on('error', (err2) => {
-                        reject(err2);
-                    });
-                    activeStream.pipe(writable).on('error', (err2) => {
-                        activeStream?.destroy(err2);
-                        reject(err2);
-                    });
-                };
-
-                // Open an explicit transaction before session setup and the
-                // cursor stream. pg-cursor uses a named portal across batches;
-                // transaction-mode poolers drop portals between implicit
-                // transactions, so BEGIN...COMMIT pins one backend for the
-                // whole stream. statement_timeout is also set inside the txn
-                // so it applies on the same backend as the cursor.
-                const sessionStart = performance.now();
-                client
-                    .query('BEGIN')
-                    .then(() => {
-                        transactionOpen = true;
-                        return client.query(
-                            `SET statement_timeout = ${statementTimeoutMs}`,
-                        );
-                    })
-                    .then(() => {
-                        if (options?.timezone) {
-                            console.debug(
-                                `Setting postgres session timezone ${options?.timezone}`,
-                            );
-                            return client.query(
-                                `SET timezone TO '${options?.timezone}'`,
-                            );
-                        }
-                        return undefined;
-                    })
-                    .then(() => {
-                        reportPhase?.(
-                            'session',
-                            performance.now() - sessionStart,
-                        );
-                        runQuery();
-                    })
-                    .catch((sessionError) => {
-                        reject(sessionError);
-                    });
+            poolClient.on('error', (e) => {
+                console.error(`Postgres client error ${getErrorMessage(e)}`);
             });
-        })
-            .catch((e) => {
-                if (e instanceof WarehouseQueryError) {
-                    throw e;
+
+            let abortWithError: (error: Error) => void = () => undefined;
+            const aborted = new Promise<never>((_, reject) => {
+                abortWithError = reject;
+            });
+
+            poolClient.on('notice', (notice) => {
+                const error = PostgresClient.getNoticeError(notice);
+                if (!error) {
+                    return;
                 }
-                const error = e as pg.DatabaseError;
-                throw this.parseError(error, sql);
-            })
-            .finally(async () => {
-                if (queryTimeout) {
-                    clearTimeout(queryTimeout);
+                noticeError = error;
+                forceDestroyClient(poolClient);
+                abortWithError(error);
+            });
+
+            queryTimeout = setTimeout(() => {
+                timeoutError = new WarehouseQueryError(
+                    `Query timed out after ${Math.round(
+                        clientTimeoutMs / 1000,
+                    )}s`,
+                );
+                forceDestroyClient(poolClient);
+                abortWithError(timeoutError);
+            }, clientTimeoutMs);
+
+            const runQuery = async () => {
+                const sessionStart = performance.now();
+                await poolClient!.query(
+                    `SET statement_timeout = ${statementTimeoutMs}`,
+                );
+                if (options?.timezone) {
+                    console.debug(
+                        `Setting postgres session timezone ${options.timezone}`,
+                    );
+                    await poolClient!.query(
+                        `SET timezone TO '${options.timezone}'`,
+                    );
+                }
+                reportPhase?.('session', performance.now() - sessionStart);
+
+                const queryStart = performance.now();
+                // CodeQL: user-defined raw SQL is intentional — warehouse, not app DB.
+                const result = await poolClient!.query(
+                    this.getSQLWithMetadata(sql, options?.tags),
+                    options?.values,
+                );
+                reportPhase?.('query', performance.now() - queryStart);
+
+                if (noticeError) {
+                    throw noticeError;
                 }
 
-                let releaseMode: 'soft' | 'destroy' | 'none' = 'none';
-                let poolEndOutcome:
-                    | 'success'
-                    | 'error'
-                    | 'timeout'
-                    | 'skipped' = 'skipped';
+                const fetchStart = performance.now();
+                if (result.rows.length > 0) {
+                    const fields = PostgresClient.convertQueryResultFields(
+                        result.fields,
+                    );
+                    for (
+                        let i = 0;
+                        i < result.rows.length;
+                        i += STREAM_CALLBACK_CHUNK_SIZE
+                    ) {
+                        // eslint-disable-next-line no-await-in-loop
+                        await streamCallback({
+                            fields,
+                            rows: result.rows.slice(
+                                i,
+                                i + STREAM_CALLBACK_CHUNK_SIZE,
+                            ),
+                        });
+                    }
+                    reportPhase?.('fetch', performance.now() - fetchStart);
+                } else {
+                    reportPhase?.('fetch', 0);
+                }
+            };
 
-                // Never ROLLBACK after a failed cursor stream. The connection
-                // is mid extended-protocol (often last_sent=H / last_received=E
-                // at the pooler); a queued ROLLBACK races with pg-cursor close
-                // and keeps the TCP session open, pinning the backend forever.
-                if (!cleanSuccess) {
-                    transactionOpen = false;
-                    forceDestroyClient(poolClient);
-                    try {
-                        activeStream?.destroy(
+            const queryWork = runQuery();
+            try {
+                await Promise.race([queryWork, aborted]);
+                cleanSuccess = true;
+            } finally {
+                // Timeout may win the race while queryWork is still in flight.
+                void queryWork.catch(() => undefined);
+            }
+        } catch (e) {
+            if (timeoutError) {
+                throw timeoutError;
+            }
+            if (noticeError) {
+                throw noticeError;
+            }
+            if (e instanceof WarehouseQueryError) {
+                throw e;
+            }
+            throw this.parseError(e as pg.DatabaseError, sql);
+        } finally {
+            if (queryTimeout) {
+                clearTimeout(queryTimeout);
+            }
+
+            let releaseMode: 'soft' | 'destroy' | 'none' = 'none';
+            let poolEndOutcome: 'success' | 'error' | 'timeout' | 'skipped' =
+                'skipped';
+
+            if (poolClient) {
+                try {
+                    if (cleanSuccess) {
+                        releaseMode = 'soft';
+                        poolClient.release();
+                    } else {
+                        releaseMode = 'destroy';
+                        forceDestroyClient(poolClient);
+                        poolClient.release(
                             new Error(
                                 'postgres warehouse stream failed; discarding client',
                             ),
                         );
-                    } catch {
-                        // ignore
                     }
-
-                    if (closeClient) {
-                        releaseMode = 'destroy';
-                        try {
-                            closeClient(
-                                new Error(
-                                    'postgres warehouse stream failed; discarding client',
-                                ),
-                            );
-                        } catch (releaseError) {
-                            console.warn(
-                                'Error releasing client:',
-                                releaseError,
-                            );
-                        }
-                    }
-
-                    if (pool) {
-                        try {
-                            await withTimeout(
-                                pool.end(),
-                                CLEANUP_POOL_END_TIMEOUT_MS,
-                                'postgres pool.end',
-                            );
-                            poolEndOutcome = 'success';
-                        } catch (poolError) {
-                            poolEndOutcome =
-                                poolError instanceof Error &&
-                                poolError.message.includes('timed out')
-                                    ? 'timeout'
-                                    : 'error';
-                            console.info(
-                                'Failed to end postgres pool:',
-                                poolError,
-                            );
-                        }
-                    }
-
-                    // pool.end() can resolve before the socket is gone; always
-                    // hard-kill again so poolers release the server slot.
+                } catch (releaseError) {
+                    console.warn('Error releasing client:', releaseError);
                     forceDestroyClient(poolClient);
-                    console.warn(
-                        `Postgres warehouse stream cleanup: release=${releaseMode} pool.end=${poolEndOutcome}`,
+                    releaseMode = 'destroy';
+                }
+            }
+
+            if (pool) {
+                try {
+                    await withTimeout(
+                        pool.end(),
+                        CLEANUP_POOL_END_TIMEOUT_MS,
+                        'postgres pool.end',
                     );
-                    return;
+                    poolEndOutcome = 'success';
+                } catch (poolError) {
+                    poolEndOutcome =
+                        poolError instanceof Error &&
+                        poolError.message.includes('timed out')
+                            ? 'timeout'
+                            : 'error';
+                    console.info('Failed to end postgres pool:', poolError);
+                    forceDestroyClient(poolClient);
                 }
+            }
 
-                if (closeClient) {
-                    try {
-                        releaseMode = 'soft';
-                        closeClient();
-                    } catch (releaseError) {
-                        console.warn('Error releasing client:', releaseError);
-                        forceDestroyClient(poolClient);
-                        releaseMode = 'destroy';
-                    }
-                }
-
-                if (pool) {
-                    try {
-                        await withTimeout(
-                            pool.end(),
-                            CLEANUP_POOL_END_TIMEOUT_MS,
-                            'postgres pool.end',
-                        );
-                        poolEndOutcome = 'success';
-                    } catch (poolError) {
-                        poolEndOutcome =
-                            poolError instanceof Error &&
-                            poolError.message.includes('timed out')
-                                ? 'timeout'
-                                : 'error';
-                        console.info('Failed to end postgres pool:', poolError);
-                        forceDestroyClient(poolClient);
-                    }
-                }
-            });
+            if (!cleanSuccess) {
+                forceDestroyClient(poolClient);
+                console.warn(
+                    `Postgres warehouse stream cleanup: release=${releaseMode} pool.end=${poolEndOutcome}`,
+                );
+            }
+        }
     }
 
     async getCatalog(
