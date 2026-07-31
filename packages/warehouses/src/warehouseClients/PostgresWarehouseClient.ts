@@ -150,7 +150,6 @@ const DEFAULT_STATEMENT_TIMEOUT_MS = 1000 * 60 * 9; // 9 minutes
 // never reports back (e.g. a dead SSH tunnel socket).
 const CLIENT_STATEMENT_TIMEOUT_BUFFER_MS = 1000 * 30; // 30 seconds
 
-const CLEANUP_ROLLBACK_TIMEOUT_MS = 1500;
 const CLEANUP_POOL_END_TIMEOUT_MS = 2000;
 
 // Each streamQuery opens its own TCP session. Cap process-wide concurrency so
@@ -259,18 +258,31 @@ const withTimeout = async <T>(
     }
 };
 
+type DestroyableClient = pg.PoolClient & {
+    connection?: {
+        stream?: {
+            destroyed?: boolean;
+            destroy: (err?: Error) => void;
+        };
+    };
+    end?: () => Promise<void>;
+};
+
+// Mid-stream extended-protocol errors leave the socket unusable. Graceful
+// client.end() / ROLLBACK can hang behind a stuck pg-cursor close, so we mark
+// the client unqueryable and hard-destroy the TCP stream. That is what lets
+// transaction-mode poolers (pgdog) release the pinned backend.
 const forceDestroyClient = (client: pg.PoolClient | undefined): void => {
     if (!client) {
         return;
     }
-    const maybeClient = client as pg.PoolClient & {
-        connection?: { stream?: { destroy: (err?: Error) => void } };
-        end?: () => Promise<void>;
-    };
-    if (maybeClient.connection?.stream?.destroy) {
-        maybeClient.connection.stream.destroy(
-            new Error('postgres warehouse client force-destroyed'),
-        );
+    const maybeClient = client as DestroyableClient;
+    // node-pg private flags: force client.end() onto the stream.destroy path
+    Reflect.set(maybeClient, '_queryable', false);
+    Reflect.set(maybeClient, '_ending', true);
+    const stream = maybeClient.connection?.stream;
+    if (stream && !stream.destroyed && typeof stream.destroy === 'function') {
+        stream.destroy(new Error('postgres warehouse client force-destroyed'));
         return;
     }
     if (maybeClient.end) {
@@ -672,59 +684,84 @@ export class PostgresClient<
                     clearTimeout(queryTimeout);
                 }
 
-                let rollbackOutcome:
-                    | 'success'
-                    | 'error'
-                    | 'timeout'
-                    | 'skipped' = 'skipped';
                 let releaseMode: 'soft' | 'destroy' | 'none' = 'none';
                 let poolEndOutcome:
                     | 'success'
                     | 'error'
                     | 'timeout'
                     | 'skipped' = 'skipped';
-                let discardClient = !cleanSuccess;
 
-                if (transactionOpen && poolClient) {
-                    try {
-                        await withTimeout(
-                            poolClient.query('ROLLBACK'),
-                            CLEANUP_ROLLBACK_TIMEOUT_MS,
-                            'postgres ROLLBACK',
-                        );
-                        rollbackOutcome = 'success';
-                    } catch (rollbackError) {
-                        discardClient = true;
-                        rollbackOutcome =
-                            rollbackError instanceof Error &&
-                            rollbackError.message.includes('timed out')
-                                ? 'timeout'
-                                : 'error';
-                        console.warn(
-                            'Error rolling back postgres transaction:',
-                            rollbackError,
-                        );
-                    }
+                // Never ROLLBACK after a failed cursor stream. The connection
+                // is mid extended-protocol (often last_sent=H / last_received=E
+                // at the pooler); a queued ROLLBACK races with pg-cursor close
+                // and keeps the TCP session open, pinning the backend forever.
+                if (!cleanSuccess) {
                     transactionOpen = false;
-                }
-
-                if (closeClient) {
+                    forceDestroyClient(poolClient);
                     try {
-                        if (discardClient) {
-                            releaseMode = 'destroy';
+                        activeStream?.destroy(
+                            new Error(
+                                'postgres warehouse stream failed; discarding client',
+                            ),
+                        );
+                    } catch {
+                        // ignore
+                    }
+
+                    if (closeClient) {
+                        releaseMode = 'destroy';
+                        try {
                             closeClient(
                                 new Error(
                                     'postgres warehouse stream failed; discarding client',
                                 ),
                             );
-                        } else {
-                            releaseMode = 'soft';
-                            closeClient();
+                        } catch (releaseError) {
+                            console.warn(
+                                'Error releasing client:',
+                                releaseError,
+                            );
                         }
+                    }
+
+                    if (pool) {
+                        try {
+                            await withTimeout(
+                                pool.end(),
+                                CLEANUP_POOL_END_TIMEOUT_MS,
+                                'postgres pool.end',
+                            );
+                            poolEndOutcome = 'success';
+                        } catch (poolError) {
+                            poolEndOutcome =
+                                poolError instanceof Error &&
+                                poolError.message.includes('timed out')
+                                    ? 'timeout'
+                                    : 'error';
+                            console.info(
+                                'Failed to end postgres pool:',
+                                poolError,
+                            );
+                        }
+                    }
+
+                    // pool.end() can resolve before the socket is gone; always
+                    // hard-kill again so poolers release the server slot.
+                    forceDestroyClient(poolClient);
+                    console.warn(
+                        `Postgres warehouse stream cleanup: release=${releaseMode} pool.end=${poolEndOutcome}`,
+                    );
+                    return;
+                }
+
+                if (closeClient) {
+                    try {
+                        releaseMode = 'soft';
+                        closeClient();
                     } catch (releaseError) {
-                        discardClient = true;
                         console.warn('Error releasing client:', releaseError);
                         forceDestroyClient(poolClient);
+                        releaseMode = 'destroy';
                     }
                 }
 
@@ -745,12 +782,6 @@ export class PostgresClient<
                         console.info('Failed to end postgres pool:', poolError);
                         forceDestroyClient(poolClient);
                     }
-                }
-
-                if (!cleanSuccess) {
-                    console.warn(
-                        `Postgres warehouse stream cleanup: rollback=${rollbackOutcome} release=${releaseMode} pool.end=${poolEndOutcome}`,
-                    );
                 }
             });
     }

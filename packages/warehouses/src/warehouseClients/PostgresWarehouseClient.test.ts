@@ -246,7 +246,7 @@ describe('PostgresWarehouseClient statement timeout', () => {
         expect(endMock).toHaveBeenCalledTimes(1);
     });
 
-    it('rolls back and destroys the client when the cursor stream fails', async () => {
+    it('skips ROLLBACK and destroys the client when the cursor stream fails', async () => {
         const queryMock = vi.fn((arg: unknown) => {
             if (typeof arg === 'string') {
                 return Promise.resolve({ rows: [], fields: [] });
@@ -267,7 +267,9 @@ describe('PostgresWarehouseClient statement timeout', () => {
         const stringQueries = stringQueriesFrom(queryMock);
 
         expect(stringQueries[0]).toBe('BEGIN');
-        expect(stringQueries).toContain('ROLLBACK');
+        // ROLLBACK on a poisoned extended-protocol connection races with
+        // pg-cursor close and pins pooler backends; hard-destroy only.
+        expect(stringQueries).not.toContain('ROLLBACK');
         expect(stringQueries).not.toContain('COMMIT');
 
         expect(releaseMock).toHaveBeenCalledTimes(1);
@@ -309,13 +311,9 @@ describe('PostgresWarehouseClient statement timeout', () => {
         expect(endMock).toHaveBeenCalledTimes(1);
     });
 
-    it('destroys the client and ends the pool when ROLLBACK hangs', async () => {
-        vi.useFakeTimers();
+    it('destroys the client without issuing ROLLBACK when the stream fails', async () => {
         const queryMock = vi.fn((arg: unknown) => {
             if (typeof arg === 'string') {
-                if (arg === 'ROLLBACK') {
-                    return new Promise(() => {});
-                }
                 return Promise.resolve({ rows: [], fields: [] });
             }
             const stream = new PassThrough();
@@ -324,21 +322,41 @@ describe('PostgresWarehouseClient statement timeout', () => {
             }, 10);
             return stream;
         });
-        const { releaseMock, endMock } = mockPoolWithQuery(queryMock);
+        const client = {
+            query: queryMock,
+            on: vi.fn(),
+            connection: {
+                stream: {
+                    destroyed: false,
+                    destroy: vi.fn(
+                        function destroy(this: { destroyed: boolean }) {
+                            this.destroyed = true;
+                        },
+                    ),
+                },
+            },
+        };
+        Reflect.set(client, '_queryable', true);
+        const releaseMock = vi.fn();
+        const endMock = vi.fn(async () => undefined);
+        (pg.Pool as unknown as Mock).mockImplementationOnce(function () {
+            return {
+                connect: vi.fn((callback) => {
+                    callback(null, client, releaseMock);
+                }),
+                end: endMock,
+                on: vi.fn(),
+            };
+        });
         const warehouse = new PostgresWarehouseClient(credentials);
 
-        const resultPromise = warehouse.runQuery('select 1');
-        await Promise.all([
-            expect(resultPromise).rejects.toThrow(
-                'portal "C_1" does not exist',
-            ),
-            (async () => {
-                await vi.advanceTimersByTimeAsync(20);
-                await vi.advanceTimersByTimeAsync(1500);
-            })(),
-        ]);
+        await expect(warehouse.runQuery('select 1')).rejects.toThrow(
+            'portal "C_1" does not exist',
+        );
 
-        expect(stringQueriesFrom(queryMock)).toContain('ROLLBACK');
+        expect(stringQueriesFrom(queryMock)).not.toContain('ROLLBACK');
+        expect(client.connection.stream.destroy).toHaveBeenCalled();
+        expect(Reflect.get(client, '_queryable')).toBe(false);
         expect(releaseMock).toHaveBeenCalledTimes(1);
         expect(releaseMock.mock.calls[0][0]).toBeInstanceOf(Error);
         expect(endMock).toHaveBeenCalledTimes(1);
@@ -360,7 +378,7 @@ describe('PostgresWarehouseClient statement timeout', () => {
             vi.advanceTimersByTimeAsync(570 * 1000 + 1000),
         ]);
 
-        expect(stringQueriesFrom(queryMock)).toContain('ROLLBACK');
+        expect(stringQueriesFrom(queryMock)).not.toContain('ROLLBACK');
         expect(releaseMock).toHaveBeenCalledTimes(1);
         expect(releaseMock.mock.calls[0][0]).toBeInstanceOf(Error);
         expect(endMock).toHaveBeenCalledTimes(1);
