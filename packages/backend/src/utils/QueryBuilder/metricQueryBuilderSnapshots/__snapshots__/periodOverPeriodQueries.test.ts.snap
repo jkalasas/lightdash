@@ -95,6 +95,73 @@ LIMIT
   100"
 `;
 
+exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snapshot for a fanout-protected period-over-period query with no dimensions 1`] = `
+"WITH
+  cte_keys_table2 AS (
+    SELECT DISTINCT
+      "table2".id AS "pk_id"
+    FROM
+      "db"."schema"."table1" AS "table1"
+      LEFT OUTER JOIN "db"."schema"."table2" AS "table2" ON ("table1".shared) = ("table2".shared)
+    WHERE
+      (
+        (("table2".is_completed) = true)
+        AND (
+          (DATE_TRUNC('YEAR', "table2".order_date)) = ('2025-01-01')
+        )
+      )
+  ),
+  cte_metrics_table2 AS (
+    SELECT
+      SUM("table2".amount) AS "table2_metric_amount"
+    FROM
+      cte_keys_table2
+      LEFT JOIN "db"."schema"."table2" AS "table2" ON cte_keys_table2."pk_id" = "table2".id
+  ),
+  cte_pop_min_max_table2__year_1__00355f4s AS (
+    SELECT
+      MIN(DATE_TRUNC('YEAR', "table2".order_date)) as min_date,
+      MAX(DATE_TRUNC('YEAR', "table2".order_date)) as max_date
+    FROM
+      "db"."schema"."table1" AS "table1"
+      LEFT OUTER JOIN "db"."schema"."table2" AS "table2" ON ("table1".shared) = ("table2".shared)
+    WHERE
+      (
+        (("table2".is_completed) = true)
+        AND (
+          (DATE_TRUNC('YEAR', "table2".order_date)) = ('2025-01-01')
+        )
+      )
+  ),
+  cte_pop_keys_table2__year_1__00355f4s AS (
+    SELECT DISTINCT
+      "table2".id AS "pk_id"
+    FROM
+      "db"."schema"."table1" AS "table1"
+      LEFT OUTER JOIN "db"."schema"."table2" AS "table2" ON ("table1".shared) = ("table2".shared)
+      LEFT JOIN cte_pop_min_max_table2__year_1__00355f4s ON TRUE
+    WHERE
+      ((("table2".is_completed) = true))
+      AND DATE_TRUNC('YEAR', "table2".order_date) >= cte_pop_min_max_table2__year_1__00355f4s.min_date - INTERVAL '1 YEAR'
+      AND DATE_TRUNC('YEAR', "table2".order_date) <= cte_pop_min_max_table2__year_1__00355f4s.max_date - INTERVAL '1 YEAR'
+  ),
+  cte_pop_metrics_table2__year_1__00355f4s AS (
+    SELECT
+      SUM("table2".amount) AS "table2_metric_amount__pop__year_1__fanout"
+    FROM
+      cte_pop_keys_table2__year_1__00355f4s
+      LEFT JOIN "db"."schema"."table2" AS "table2" ON cte_pop_keys_table2__year_1__00355f4s."pk_id" = "table2".id
+  )
+SELECT
+  cte_metrics_table2."table2_metric_amount" AS "table2_metric_amount",
+  cte_pop_metrics_table2__year_1__00355f4s."table2_metric_amount__pop__year_1__fanout" AS "table2_metric_amount__pop__year_1__fanout"
+FROM
+  cte_metrics_table2
+  CROSS JOIN cte_pop_metrics_table2__year_1__00355f4s
+LIMIT
+  1"
+`;
+
 exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snapshot for a one-to-many fanout-protected period-over-period query 1`] = `
 "WITH
   cte_keys_country_orders AS (
@@ -223,6 +290,62 @@ LIMIT
   100"
 `;
 
+exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snapshot for a period-over-period grand total 1`] = `
+"WITH
+  base_metrics AS (
+    SELECT
+      SUM("orders".amount) AS "orders_total_order_amount"
+    FROM
+      "postgres"."jaffle"."orders" AS "orders"
+    WHERE
+      (
+        (("orders".is_completed) = true)
+        AND (
+          (DATE_TRUNC('YEAR', "orders".order_date)) = ('2025-01-01')
+        )
+      )
+  ),
+  pop_min_max_year_1__00jq2hag AS (
+    SELECT
+      MIN(DATE_TRUNC('YEAR', "orders".order_date)) as min_date,
+      MAX(DATE_TRUNC('YEAR', "orders".order_date)) as max_date
+    FROM
+      "postgres"."jaffle"."orders" AS "orders"
+    WHERE
+      (
+        (("orders".is_completed) = true)
+        AND (
+          (DATE_TRUNC('YEAR', "orders".order_date)) = ('2025-01-01')
+        )
+      )
+  ),
+  pop_metrics_year_1__00jq2hag AS (
+    SELECT
+      SUM("orders".amount) AS "orders_total_order_amount__pop__year_1__snapshot"
+    FROM
+      "postgres"."jaffle"."orders" AS "orders"
+      LEFT JOIN pop_min_max_year_1__00jq2hag ON TRUE
+    WHERE
+      ((("orders".is_completed) = true))
+      AND DATE_TRUNC('YEAR', "orders".order_date) >= pop_min_max_year_1__00jq2hag.min_date - INTERVAL '1 YEAR'
+      AND DATE_TRUNC('YEAR', "orders".order_date) <= pop_min_max_year_1__00jq2hag.max_date - INTERVAL '1 YEAR'
+  ),
+  metrics AS (
+    SELECT
+      base_metrics.*,
+      pop_metrics_year_1__00jq2hag."orders_total_order_amount__pop__year_1__snapshot" AS "orders_total_order_amount__pop__year_1__snapshot"
+    FROM
+      base_metrics
+      CROSS JOIN pop_metrics_year_1__00jq2hag
+  )
+SELECT
+  *
+FROM
+  metrics
+LIMIT
+  1"
+`;
+
 exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snapshot for a period-over-period query 1`] = `
 "WITH
   base_metrics AS (
@@ -280,6 +403,62 @@ ORDER BY
   "orders_order_date_year" DESC
 LIMIT
   500"
+`;
+
+exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snapshot for a period-over-period query with no dimensions 1`] = `
+"WITH
+  base_metrics AS (
+    SELECT
+      SUM("orders".amount) AS "orders_total_order_amount"
+    FROM
+      "postgres"."jaffle"."orders" AS "orders"
+    WHERE
+      (
+        (("orders".is_completed) = true)
+        AND (
+          (DATE_TRUNC('YEAR', "orders".order_date)) = ('2025-01-01')
+        )
+      )
+  ),
+  pop_min_max_year_1__00jq2hag AS (
+    SELECT
+      MIN(DATE_TRUNC('YEAR', "orders".order_date)) as min_date,
+      MAX(DATE_TRUNC('YEAR', "orders".order_date)) as max_date
+    FROM
+      "postgres"."jaffle"."orders" AS "orders"
+    WHERE
+      (
+        (("orders".is_completed) = true)
+        AND (
+          (DATE_TRUNC('YEAR', "orders".order_date)) = ('2025-01-01')
+        )
+      )
+  ),
+  pop_metrics_year_1__00jq2hag AS (
+    SELECT
+      SUM("orders".amount) AS "orders_total_order_amount__pop__year_1__snapshot"
+    FROM
+      "postgres"."jaffle"."orders" AS "orders"
+      LEFT JOIN pop_min_max_year_1__00jq2hag ON TRUE
+    WHERE
+      ((("orders".is_completed) = true))
+      AND DATE_TRUNC('YEAR', "orders".order_date) >= pop_min_max_year_1__00jq2hag.min_date - INTERVAL '1 YEAR'
+      AND DATE_TRUNC('YEAR', "orders".order_date) <= pop_min_max_year_1__00jq2hag.max_date - INTERVAL '1 YEAR'
+  ),
+  metrics AS (
+    SELECT
+      base_metrics.*,
+      pop_metrics_year_1__00jq2hag."orders_total_order_amount__pop__year_1__snapshot" AS "orders_total_order_amount__pop__year_1__snapshot"
+    FROM
+      base_metrics
+      CROSS JOIN pop_metrics_year_1__00jq2hag
+  )
+SELECT
+  *
+FROM
+  metrics
+LIMIT
+  1"
 `;
 
 exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snapshot for a period-over-period query with only a date filter 1`] = `
@@ -386,6 +565,76 @@ FROM
   metrics
 ORDER BY
   "orders_order_date_year" DESC
+LIMIT
+  500"
+`;
+
+exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snapshot for a period-over-period query without its time dimension 1`] = `
+"WITH
+  base_metrics AS (
+    SELECT
+      "orders".is_completed AS "orders_is_completed",
+      SUM("orders".amount) AS "orders_total_order_amount"
+    FROM
+      "postgres"."jaffle"."orders" AS "orders"
+    WHERE
+      (
+        (("orders".is_completed) = true)
+        AND (
+          (DATE_TRUNC('YEAR', "orders".order_date)) = ('2025-01-01')
+        )
+      )
+    GROUP BY
+      1
+  ),
+  pop_min_max_year_1__00jq2hag AS (
+    SELECT
+      MIN(DATE_TRUNC('YEAR', "orders".order_date)) as min_date,
+      MAX(DATE_TRUNC('YEAR', "orders".order_date)) as max_date
+    FROM
+      "postgres"."jaffle"."orders" AS "orders"
+    WHERE
+      (
+        (("orders".is_completed) = true)
+        AND (
+          (DATE_TRUNC('YEAR', "orders".order_date)) = ('2025-01-01')
+        )
+      )
+  ),
+  pop_metrics_year_1__00jq2hag AS (
+    SELECT
+      "orders".is_completed AS "orders_is_completed",
+      SUM("orders".amount) AS "orders_total_order_amount__pop__year_1__snapshot"
+    FROM
+      "postgres"."jaffle"."orders" AS "orders"
+      LEFT JOIN pop_min_max_year_1__00jq2hag ON TRUE
+    WHERE
+      ((("orders".is_completed) = true))
+      AND DATE_TRUNC('YEAR', "orders".order_date) >= pop_min_max_year_1__00jq2hag.min_date - INTERVAL '1 YEAR'
+      AND DATE_TRUNC('YEAR', "orders".order_date) <= pop_min_max_year_1__00jq2hag.max_date - INTERVAL '1 YEAR'
+    GROUP BY
+      1
+  ),
+  metrics AS (
+    SELECT
+      base_metrics.*,
+      pop_metrics_year_1__00jq2hag."orders_total_order_amount__pop__year_1__snapshot" AS "orders_total_order_amount__pop__year_1__snapshot"
+    FROM
+      base_metrics
+      LEFT JOIN pop_metrics_year_1__00jq2hag ON (
+        base_metrics."orders_is_completed" = pop_metrics_year_1__00jq2hag."orders_is_completed"
+        OR (
+          base_metrics."orders_is_completed" IS NULL
+          AND pop_metrics_year_1__00jq2hag."orders_is_completed" IS NULL
+        )
+      )
+  )
+SELECT
+  *
+FROM
+  metrics
+ORDER BY
+  "orders_is_completed"
 LIMIT
   500"
 `;

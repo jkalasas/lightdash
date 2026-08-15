@@ -712,4 +712,71 @@ describe('MetricQueryBuilder snapshot: period-over-period queries', () => {
             }),
         ).toMatchSnapshot();
     });
+
+    // Grand-total shape: time dim is not selected, so min/max come from the
+    // filtered explore and the comparison CTE is CROSS JOINed as a scalar.
+    test('matches snapshot for a period-over-period query with no dimensions', () => {
+        expect(
+            buildQuery({
+                explore: POP_TEST_EXPLORE,
+                compiledMetricQuery: {
+                    ...POP_TEST_METRIC_QUERY,
+                    dimensions: [],
+                    sorts: [],
+                    limit: 1,
+                },
+            }),
+        ).toMatchSnapshot();
+    });
+
+    // Column-total shape: time dim is dropped but another dimension remains.
+    // Comparison rows join only on the remaining dim, not on shifted time.
+    test('matches snapshot for a period-over-period query without its time dimension', () => {
+        expect(
+            buildQuery({
+                explore: POP_TEST_EXPLORE,
+                compiledMetricQuery: {
+                    ...POP_TEST_METRIC_QUERY,
+                    dimensions: ['orders_is_completed'],
+                    sorts: [
+                        {
+                            fieldId: 'orders_is_completed',
+                            descending: false,
+                        },
+                    ],
+                },
+            }),
+        ).toMatchSnapshot();
+    });
+
+    // Production totals path: TotalQueryBuilder collapses the source query,
+    // then MetricQueryBuilder compiles PoP at the grand-total grain.
+    test('matches snapshot for a period-over-period grand total', () => {
+        expect(
+            buildQuery({
+                explore: POP_TEST_EXPLORE,
+                compiledMetricQuery: POP_TEST_METRIC_QUERY,
+                totalConfiguration: {
+                    kind: 'grandTotal',
+                    subtotalDimensions: undefined,
+                },
+            }),
+        ).toMatchSnapshot();
+    });
+
+    // Fanout-protected PoP at grand-total grain: min/max must be scanned from
+    // the explore because the keyed CTE no longer projects the time dim.
+    test('matches snapshot for a fanout-protected period-over-period query with no dimensions', () => {
+        expect(
+            buildQuery({
+                explore: POP_TEST_FANOUT_EXPLORE,
+                compiledMetricQuery: {
+                    ...POP_TEST_FANOUT_METRIC_QUERY,
+                    dimensions: [],
+                    sorts: [],
+                    limit: 1,
+                },
+            }),
+        ).toMatchSnapshot();
+    });
 });

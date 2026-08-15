@@ -258,7 +258,7 @@ describe('TotalQueryBuilder: grandTotal', () => {
         expect(result.tableCalculations).toEqual([]);
     });
 
-    it('drops calcs that reference a stripped period-over-period metric', () => {
+    it('keeps calcs that reference a period-over-period metric', () => {
         const result = new TotalQueryBuilder({
             metricQuery: {
                 ...baseMetricQuery,
@@ -291,7 +291,9 @@ describe('TotalQueryBuilder: grandTotal', () => {
             kind: 'grandTotal',
         }).compileQuery().metricQuery;
 
-        expect(result.tableCalculations).toEqual([]);
+        expect(result.tableCalculations).toEqual([
+            expect.objectContaining({ name: 'pop_delta' }),
+        ]);
     });
 
     it('preserves the metrics list when no PoP metrics are present', () => {
@@ -329,7 +331,7 @@ describe('TotalQueryBuilder: grandTotal', () => {
         expect(result.customDimensions).toBe(customDimensions);
     });
 
-    it('strips period-over-period additional metrics from both lists', () => {
+    it('preserves period-over-period additional metrics in both lists', () => {
         const result = new TotalQueryBuilder({
             metricQuery: {
                 ...baseMetricQuery,
@@ -355,8 +357,16 @@ describe('TotalQueryBuilder: grandTotal', () => {
             kind: 'grandTotal',
         }).compileQuery().metricQuery;
 
-        expect(result.metrics).toEqual(['orders_total_revenue']);
-        expect(result.additionalMetrics).toEqual([]);
+        expect(result.metrics).toEqual([
+            'orders_total_revenue',
+            'orders_total_revenue_pop_12m',
+        ]);
+        expect(result.additionalMetrics).toEqual([
+            expect.objectContaining({
+                name: 'total_revenue_pop_12m',
+                generationType: 'periodOverPeriod',
+            }),
+        ]);
     });
 
     it('returns no sourceQuery when the source has no metric/table-calc filters or sum-of-rows calcs', () => {
@@ -424,14 +434,22 @@ describe('TotalQueryBuilder: nothing to total', () => {
         ).toThrow(NotSupportedError);
     });
 
-    it('refuses a grand total when the only metrics are period-over-period', () => {
-        expect(() =>
-            new TotalQueryBuilder({
-                metricQuery: popOnlyMetricQuery,
-                pivotConfiguration: null,
-                kind: 'grandTotal',
-            }).compileQuery(),
-        ).toThrow(NotSupportedError);
+    it('allows a grand total when the only metrics are period-over-period', () => {
+        const result = new TotalQueryBuilder({
+            metricQuery: popOnlyMetricQuery,
+            pivotConfiguration: null,
+            kind: 'grandTotal',
+        }).compileQuery();
+
+        expect(result.metricQuery.metrics).toEqual([
+            'orders_total_revenue_pop_12m',
+        ]);
+        expect(result.metricQuery.additionalMetrics).toEqual([
+            expect.objectContaining({
+                name: 'total_revenue_pop_12m',
+                generationType: 'periodOverPeriod',
+            }),
+        ]);
     });
 
     it('refuses a grand total when the only table calc is not totalable', () => {
@@ -498,23 +516,38 @@ describe('TotalQueryBuilder: nothing to total', () => {
         ).toThrow(NotSupportedError);
     });
 
-    it('refuses column and row subtotals when the only metrics are period-over-period', () => {
-        expect(() =>
-            new TotalQueryBuilder({
-                metricQuery: popOnlyMetricQuery,
-                pivotConfiguration: null,
-                subtotalDimensions: ['orders_status'],
-                kind: 'columnSubtotal',
-            }).compileQuery(),
-        ).toThrow(NotSupportedError);
-        expect(() =>
-            new TotalQueryBuilder({
-                metricQuery: popOnlyMetricQuery,
-                pivotConfiguration,
-                subtotalDimensions: ['orders_created_at'],
-                kind: 'rowSubtotal',
-            }).compileQuery(),
-        ).toThrow(NotSupportedError);
+    it('allows column and row subtotals when the only metrics are period-over-period', () => {
+        const columnSubtotal = new TotalQueryBuilder({
+            metricQuery: popOnlyMetricQuery,
+            pivotConfiguration: null,
+            subtotalDimensions: ['orders_status'],
+            kind: 'columnSubtotal',
+        }).compileQuery();
+        expect(columnSubtotal.metricQuery.metrics).toEqual([
+            'orders_total_revenue_pop_12m',
+        ]);
+        expect(columnSubtotal.metricQuery.additionalMetrics).toEqual([
+            expect.objectContaining({
+                name: 'total_revenue_pop_12m',
+                generationType: 'periodOverPeriod',
+            }),
+        ]);
+
+        const rowSubtotal = new TotalQueryBuilder({
+            metricQuery: popOnlyMetricQuery,
+            pivotConfiguration,
+            subtotalDimensions: ['orders_created_at'],
+            kind: 'rowSubtotal',
+        }).compileQuery();
+        expect(rowSubtotal.metricQuery.metrics).toEqual([
+            'orders_total_revenue_pop_12m',
+        ]);
+        expect(rowSubtotal.metricQuery.additionalMetrics).toEqual([
+            expect.objectContaining({
+                name: 'total_revenue_pop_12m',
+                generationType: 'periodOverPeriod',
+            }),
+        ]);
     });
 });
 
@@ -623,9 +656,7 @@ describe('TotalQueryBuilder: columnTotal', () => {
             ).toThrow(NotSupportedError);
         });
 
-        it('strips period-over-period additional metrics so MetricQueryBuilder accepts the totals query', () => {
-            // PoP metrics need `table` + `name` (for isAdditionalMetric) plus
-            // the generated-metric metadata fields (for the PoP type guard).
+        it('preserves period-over-period additional metrics in the column total query', () => {
             const popMetricQuery: MetricQuery = {
                 ...baseMetricQuery,
                 metrics: [
@@ -655,8 +686,14 @@ describe('TotalQueryBuilder: columnTotal', () => {
 
             expect(result.metricQuery.metrics).toEqual([
                 'orders_total_revenue',
+                'orders_total_revenue_pop_12m',
             ]);
-            expect(result.metricQuery.additionalMetrics).toEqual([]);
+            expect(result.metricQuery.additionalMetrics).toEqual([
+                expect.objectContaining({
+                    name: 'total_revenue_pop_12m',
+                    generationType: 'periodOverPeriod',
+                }),
+            ]);
         });
     });
 
@@ -825,7 +862,7 @@ describe('TotalQueryBuilder: rowTotal', () => {
             ).toThrow(NotSupportedError);
         });
 
-        it('strips period-over-period additional metrics so MetricQueryBuilder accepts the totals query', () => {
+        it('preserves period-over-period additional metrics in the row total query', () => {
             const popMetricQuery: MetricQuery = {
                 ...baseMetricQuery,
                 metrics: [
@@ -855,8 +892,14 @@ describe('TotalQueryBuilder: rowTotal', () => {
 
             expect(result.metricQuery.metrics).toEqual([
                 'orders_total_revenue',
+                'orders_total_revenue_pop_12m',
             ]);
-            expect(result.metricQuery.additionalMetrics).toEqual([]);
+            expect(result.metricQuery.additionalMetrics).toEqual([
+                expect.objectContaining({
+                    name: 'total_revenue_pop_12m',
+                    generationType: 'periodOverPeriod',
+                }),
+            ]);
         });
 
         it('drops sortBy on the pivot column dimension that the collapse removes', () => {
@@ -1082,7 +1125,7 @@ describe('TotalQueryBuilder: columnSubtotal', () => {
             ).toThrow(NotSupportedError);
         });
 
-        it('strips period-over-period additional metrics', () => {
+        it('preserves period-over-period additional metrics in the column subtotal query', () => {
             const popMetricQuery: MetricQuery = {
                 ...baseMetricQuery,
                 metrics: [
@@ -1113,8 +1156,14 @@ describe('TotalQueryBuilder: columnSubtotal', () => {
 
             expect(result.metricQuery.metrics).toEqual([
                 'orders_total_revenue',
+                'orders_total_revenue_pop_12m',
             ]);
-            expect(result.metricQuery.additionalMetrics).toEqual([]);
+            expect(result.metricQuery.additionalMetrics).toEqual([
+                expect.objectContaining({
+                    name: 'total_revenue_pop_12m',
+                    generationType: 'periodOverPeriod',
+                }),
+            ]);
         });
     });
 
