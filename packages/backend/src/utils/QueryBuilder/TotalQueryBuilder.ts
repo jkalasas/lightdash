@@ -1,9 +1,7 @@
 import {
     assertUnreachable,
     convertFieldRefToFieldId,
-    getItemId,
     isFormulaTableCalculation,
-    isPeriodOverPeriodAdditionalMetric,
     isSqlTableCalculation,
     isTemplateTableCalculation,
     lightdashVariablePattern,
@@ -28,13 +26,6 @@ import {
 export type { TotalQueryKind } from './utils';
 
 const WINDOW_CLAUSE_PATTERN = /\bover\s*\(/i;
-
-const getPopMetricIds = (metricQuery: MetricQuery): Set<string> =>
-    new Set(
-        (metricQuery.additionalMetrics ?? [])
-            .filter(isPeriodOverPeriodAdditionalMetric)
-            .map(getItemId),
-    );
 
 // Extract the field ids a table calc references, or null if the calc can't be
 // safely totaled. Only pure per-row scalar arithmetic over metrics survives:
@@ -85,8 +76,8 @@ const getTotalableReferences = (calc: TableCalculation): string[] | null => {
 
 // A table calc can be totaled when it depends only on aggregated metrics:
 // applying its formula to the collapsed totals row reproduces the correct
-// total. Calcs that reference dimensions, dropped PoP metrics, sibling table
-// calcs, or use window functions are excluded (their total stays blank), as
+// total. Calcs that reference dimensions, sibling table calcs, or use
+// window functions are excluded (their total stays blank), as
 // are 'sum_of_rows' calcs (aggregated over the embedded source rows instead)
 // and 'none' calcs (totals disabled by the user).
 const getTotalableTableCalculations = (
@@ -109,7 +100,7 @@ const getTotalableTableCalculations = (
     });
 
 // Drop value columns that reference fields not present in the totals query:
-// PoP metrics and non-totalable table calcs are stripped from the metric query,
+// non-totalable table calcs are stripped from the metric query,
 // but the pivot still lists them. Keeping them makes PivotQueryBuilder aggregate
 // a column that was never selected, failing the whole totals SQL. Sum-of-rows
 // calcs stay: their columns are joined into the flat totals SQL.
@@ -238,29 +229,22 @@ export class TotalQueryBuilder {
         };
     }
 
-    // Strip a MetricQuery down to a one-row grand total. PoP metrics are
-    // dropped because they require their time dim to be selected.
+    // Strip a MetricQuery down to a one-row grand total.
     private buildGrandTotalMetricQuery(): MetricQuery {
         const { metricQuery } = this.args;
-        const popMetricIds = getPopMetricIds(metricQuery);
-        const keptMetrics = metricQuery.metrics.filter(
-            (id) => !popMetricIds.has(id),
-        );
 
         const totalQuery: MetricQuery = {
             ...metricQuery,
             limit: 1,
             tableCalculations: getTotalableTableCalculations(
                 metricQuery,
-                new Set(keptMetrics),
+                new Set(metricQuery.metrics),
             ),
             sorts: [],
             dimensions: [],
             customDimensions: metricQuery.customDimensions,
-            metrics: keptMetrics,
-            additionalMetrics: (metricQuery.additionalMetrics ?? []).filter(
-                (am) => !isPeriodOverPeriodAdditionalMetric(am),
-            ),
+            metrics: metricQuery.metrics,
+            additionalMetrics: metricQuery.additionalMetrics,
             filters: hasBlockingTotalFilters(metricQuery)
                 ? stripBlockingFilters(metricQuery.filters)
                 : metricQuery.filters,
@@ -294,12 +278,7 @@ export class TotalQueryBuilder {
             );
         }
 
-        // PoP entries would fail validation once the index dim is dropped.
-        const popMetricIds = getPopMetricIds(metricQuery);
-        const keptMetrics = metricQuery.metrics.filter(
-            (id) => !popMetricIds.has(id),
-        );
-        const keptMetricIds = new Set(keptMetrics);
+        const keptMetricIds = new Set(metricQuery.metrics);
         const totalableCalcs = getTotalableTableCalculations(
             metricQuery,
             keptMetricIds,
@@ -310,10 +289,8 @@ export class TotalQueryBuilder {
             dimensions: groupByFieldIds,
             sorts: [],
             tableCalculations: totalableCalcs,
-            metrics: keptMetrics,
-            additionalMetrics: (metricQuery.additionalMetrics ?? []).filter(
-                (am) => !isPeriodOverPeriodAdditionalMetric(am),
-            ),
+            metrics: metricQuery.metrics,
+            additionalMetrics: metricQuery.additionalMetrics,
             filters: hasBlockingTotalFilters(metricQuery)
                 ? stripBlockingFilters(metricQuery.filters)
                 : metricQuery.filters,
@@ -367,11 +344,6 @@ export class TotalQueryBuilder {
             );
         }
 
-        const popMetricIds = getPopMetricIds(metricQuery);
-        const keptMetrics = metricQuery.metrics.filter(
-            (id) => !popMetricIds.has(id),
-        );
-
         const subtotalMetricQuery: MetricQuery = {
             ...metricQuery,
             dimensions: [
@@ -380,12 +352,10 @@ export class TotalQueryBuilder {
             sorts: [],
             tableCalculations: getTotalableTableCalculations(
                 metricQuery,
-                new Set(keptMetrics),
+                new Set(metricQuery.metrics),
             ),
-            metrics: keptMetrics,
-            additionalMetrics: (metricQuery.additionalMetrics ?? []).filter(
-                (am) => !isPeriodOverPeriodAdditionalMetric(am),
-            ),
+            metrics: metricQuery.metrics,
+            additionalMetrics: metricQuery.additionalMetrics,
             filters: hasBlockingTotalFilters(metricQuery)
                 ? stripBlockingFilters(metricQuery.filters)
                 : metricQuery.filters,
@@ -425,11 +395,6 @@ export class TotalQueryBuilder {
             );
         }
 
-        const popMetricIds = getPopMetricIds(metricQuery);
-        const keptMetrics = metricQuery.metrics.filter(
-            (id) => !popMetricIds.has(id),
-        );
-
         return {
             metricQuery: {
                 ...metricQuery,
@@ -437,12 +402,10 @@ export class TotalQueryBuilder {
                 sorts: [],
                 tableCalculations: getTotalableTableCalculations(
                     metricQuery,
-                    new Set(keptMetrics),
+                    new Set(metricQuery.metrics),
                 ),
-                metrics: keptMetrics,
-                additionalMetrics: (metricQuery.additionalMetrics ?? []).filter(
-                    (am) => !isPeriodOverPeriodAdditionalMetric(am),
-                ),
+                metrics: metricQuery.metrics,
+                additionalMetrics: metricQuery.additionalMetrics,
                 filters: hasBlockingTotalFilters(metricQuery)
                     ? stripBlockingFilters(metricQuery.filters)
                     : metricQuery.filters,
@@ -485,15 +448,7 @@ export class TotalQueryBuilder {
             );
         }
 
-        // PoP metrics are dropped to mirror the column-total path — they assume
-        // a specific time-dim anchoring that may not survive the collapsed
-        // pivot, and keeping the two transforms symmetric makes the contract
-        // easier to reason about.
-        const popMetricIds = getPopMetricIds(metricQuery);
-        const keptMetrics = metricQuery.metrics.filter(
-            (id) => !popMetricIds.has(id),
-        );
-        const keptMetricIds = new Set(keptMetrics);
+        const keptMetricIds = new Set(metricQuery.metrics);
         const totalableCalcs = getTotalableTableCalculations(
             metricQuery,
             keptMetricIds,
@@ -504,10 +459,8 @@ export class TotalQueryBuilder {
             dimensions: indexFieldIds,
             sorts: [],
             tableCalculations: totalableCalcs,
-            metrics: keptMetrics,
-            additionalMetrics: (metricQuery.additionalMetrics ?? []).filter(
-                (am) => !isPeriodOverPeriodAdditionalMetric(am),
-            ),
+            metrics: metricQuery.metrics,
+            additionalMetrics: metricQuery.additionalMetrics,
             filters: hasBlockingTotalFilters(metricQuery)
                 ? stripBlockingFilters(metricQuery.filters)
                 : metricQuery.filters,

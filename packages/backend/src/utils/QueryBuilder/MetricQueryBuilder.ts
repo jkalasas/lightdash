@@ -575,20 +575,6 @@ export class MetricQueryBuilder {
                     configKey,
                 }),
             );
-
-            // Ensure each comparison time dimension is selected in the query (required for joins)
-            this.popComparisonConfigs.forEach((cfg) => {
-                if (
-                    !compiledMetricQuery.dimensions.includes(
-                        cfg.timeDimensionId,
-                    )
-                ) {
-                    throw new CompileError(
-                        `Period comparison time dimension "${cfg.timeDimensionId}" must be selected in the query`,
-                        {},
-                    );
-                }
-            });
         }
     }
 
@@ -777,6 +763,116 @@ export class MetricQueryBuilder {
                 this.args.compiledMetricQuery.filters.dimensions,
             );
         return this.buildDimensionsWhereClause(strippedGroup);
+    }
+
+    private isPopTimeDimensionSelected(timeDimensionId: string): boolean {
+        return this.args.compiledMetricQuery.dimensions.includes(
+            timeDimensionId,
+        );
+    }
+
+    private getPopTimeDimension(timeDimensionId: string): CompiledDimension {
+        const { warehouseSqlBuilder } = this.args;
+        return getDimensionFromId({
+            dimId: timeDimensionId,
+            dimensions: this.exploreDimensions,
+            dimensionsWithoutAccess: this.exploreDimensionsWithoutAccess,
+            adapterType: warehouseSqlBuilder.getAdapterType(),
+            startOfWeek: warehouseSqlBuilder.getStartOfWeek(),
+            timezone: this.timezoneForDateTrunc,
+            columnTimezone: this.columnTimezone,
+        });
+    }
+
+    private getPopTimeDimensionSql(timeDimensionId: string): string {
+        const { warehouseSqlBuilder } = this.args;
+        return this.getTimezoneAwareDimensionSql(
+            this.getPopTimeDimension(timeDimensionId),
+            warehouseSqlBuilder.getAdapterType(),
+            warehouseSqlBuilder.getStartOfWeek(),
+        );
+    }
+
+    private getTablesReferencedByDimensionFilters(): string[] {
+        const { compiledMetricQuery, warehouseSqlBuilder } = this.args;
+        const adapterType = warehouseSqlBuilder.getAdapterType();
+        const startOfWeek = warehouseSqlBuilder.getStartOfWeek();
+
+        return getFilterRulesFromGroup(
+            compiledMetricQuery.filters.dimensions,
+        ).flatMap((filterRule) => {
+            try {
+                const dim = getDimensionFromFilterTargetId({
+                    filterTargetId: filterRule.target.fieldId,
+                    dimensions: this.exploreDimensions,
+                    dimensionsWithoutAccess:
+                        this.exploreDimensionsWithoutAccess,
+                    compiledCustomDimensions:
+                        compiledMetricQuery.compiledCustomDimensions.filter(
+                            isCompiledCustomSqlDimension,
+                        ),
+                    adapterType,
+                    startOfWeek,
+                });
+                return dim.tablesReferences || [dim.table];
+            } catch (error) {
+                if (
+                    this.args.continueOnError &&
+                    error instanceof FieldReferenceError
+                ) {
+                    this.compilationErrors.push(error.message);
+                    return [];
+                }
+                throw error;
+            }
+        });
+    }
+
+    private buildUngroupedPopMinMaxCte(
+        cteName: string,
+        timeDimensionId: string,
+    ): string {
+        const popField = this.getPopTimeDimension(timeDimensionId);
+        const popFieldSql = this.getPopTimeDimensionSql(timeDimensionId);
+        const joins = this.getJoinsSQL({
+            tablesReferencedInDimensions: [
+                ...(popField.tablesReferences ?? [popField.table]),
+                ...this.getTablesReferencedByDimensionFilters(),
+            ],
+            tablesReferencedInMetrics: [],
+        });
+
+        return MetricQueryBuilder.wrapAsCte(cteName, [
+            'SELECT',
+            [
+                `MIN(${popFieldSql}) as min_date`,
+                `MAX(${popFieldSql}) as max_date`,
+            ].join(',\n'),
+            this.getBaseTableFromSQL(),
+            joins.joinSQL,
+            this.getDimensionsFilterSQL(),
+        ]);
+    }
+
+    private buildPopMinMaxCte(
+        cteName: string,
+        timeDimensionId: string,
+        groupedSourceCteName: string,
+    ): string {
+        if (this.isPopTimeDimensionSelected(timeDimensionId)) {
+            const fieldQuoteChar =
+                this.args.warehouseSqlBuilder.getFieldQuoteChar();
+            return MetricQueryBuilder.wrapAsCte(cteName, [
+                'SELECT',
+                [
+                    `MIN(${groupedSourceCteName}.${fieldQuoteChar}${timeDimensionId}${fieldQuoteChar}) as min_date`,
+                    `MAX(${groupedSourceCteName}.${fieldQuoteChar}${timeDimensionId}${fieldQuoteChar}) as max_date`,
+                ].join(',\n'),
+                `FROM ${groupedSourceCteName}`,
+            ]);
+        }
+
+        return this.buildUngroupedPopMinMaxCte(cteName, timeDimensionId);
     }
 
     private getDimensionsFilterSQL(): string | undefined {
@@ -3019,26 +3115,17 @@ export class MetricQueryBuilder {
                         const popFieldId = cfg.timeDimensionId;
                         const popConfigSuffix = cfg.cteSuffix;
 
-                        /**
-                         * CTE to get min and max date in deduplicated keys
-                         */
                         const popCteTablePart = snakeCaseName(tableName).slice(
                             0,
                             16,
                         );
                         const popMinMaxCteName = `cte_pop_min_max_${popCteTablePart}__${popConfigSuffix}`;
-                        const popMinMaxCteParts = [
-                            `SELECT`,
-                            [
-                                `MIN(${keysCteName}.${fieldQuoteChar}${popFieldId}${fieldQuoteChar}) as min_date`,
-                                `MAX(${keysCteName}.${fieldQuoteChar}${popFieldId}${fieldQuoteChar}) as max_date`,
-                            ].join(',\n'),
-                            `FROM ${keysCteName}`,
-                        ];
                         ctes.push(
-                            `${popMinMaxCteName} AS (\n${MetricQueryBuilder.assembleSqlParts(
-                                popMinMaxCteParts,
-                            )}\n)`,
+                            this.buildPopMinMaxCte(
+                                popMinMaxCteName,
+                                popFieldId,
+                                keysCteName,
+                            ),
                         );
 
                         /**
@@ -3254,22 +3341,13 @@ export class MetricQueryBuilder {
                     const popFieldId = cfg.timeDimensionId;
                     const popConfigSuffix = cfg.cteSuffix;
 
-                    /**
-                     * CTE to get min and max date in unaffected metrics
-                     */
                     const popUnaffectedMinMaxCteName = `cte_pop_unaffected_min_max_${popConfigSuffix}`;
-                    const popUnaffectedMinMaxCteParts = [
-                        `SELECT`,
-                        [
-                            `MIN(${unaffectedMetricsCteName}.${fieldQuoteChar}${popFieldId}${fieldQuoteChar}) as min_date`,
-                            `MAX(${unaffectedMetricsCteName}.${fieldQuoteChar}${popFieldId}${fieldQuoteChar}) as max_date`,
-                        ].join(',\n'),
-                        `FROM ${unaffectedMetricsCteName}`,
-                    ];
                     ctes.push(
-                        `${popUnaffectedMinMaxCteName} AS (\n${MetricQueryBuilder.assembleSqlParts(
-                            popUnaffectedMinMaxCteParts,
-                        )}\n)`,
+                        this.buildPopMinMaxCte(
+                            popUnaffectedMinMaxCteName,
+                            popFieldId,
+                            unaffectedMetricsCteName,
+                        ),
                     );
 
                     const popField = getDimensionFromId({
@@ -3470,13 +3548,13 @@ export class MetricQueryBuilder {
                     }),
                 ];
             } else {
-                // If there is no unaffected CTE, cross join metric CTEs
+                const allMetricCtes = [...metricCtes, ...popMetricCtes];
                 finalSelectParts = [
                     `SELECT`,
                     finalMetricSelects.join(',\n'),
-                    `FROM ${metricCtes[0].name}`,
-                    ...metricCtes
-                        .slice(1, metricCtes.length)
+                    `FROM ${allMetricCtes[0].name}`,
+                    ...allMetricCtes
+                        .slice(1)
                         .map((metricCte) => `CROSS JOIN ${metricCte.name}`),
                 ];
             }
@@ -5193,18 +5271,12 @@ export class MetricQueryBuilder {
                 const popFieldId = cfg.timeDimensionId;
 
                 const popMinMaxCteName = `pop_min_max_${popConfigSuffix}`;
-                const popMinMaxCteParts = [
-                    `SELECT`,
-                    [
-                        `MIN(${baseCteName}.${fieldQuoteChar}${popFieldId}${fieldQuoteChar}) as min_date`,
-                        `MAX(${baseCteName}.${fieldQuoteChar}${popFieldId}${fieldQuoteChar}) as max_date`,
-                    ].join(',\n'),
-                    `FROM ${baseCteName}`,
-                ];
                 ctes.push(
-                    `${popMinMaxCteName} AS (\n${MetricQueryBuilder.assembleSqlParts(
-                        popMinMaxCteParts,
-                    )}\n)`,
+                    this.buildPopMinMaxCte(
+                        popMinMaxCteName,
+                        popFieldId,
+                        baseCteName,
+                    ),
                 );
 
                 const popCteName = `pop_metrics_${popConfigSuffix}`;
