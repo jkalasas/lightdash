@@ -336,6 +336,7 @@ export class QueryComposer {
             this.context.warehouseSqlBuilder,
             this.getMetricQuery().limit,
             this.context.pivotItemsMap ?? compiledQuery.fields,
+            this.getMetricQuery().offset,
         );
         return pivotQueryBuilder.toSql({ columnLimit });
     }

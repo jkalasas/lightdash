@@ -2547,8 +2547,14 @@ export class MetricQueryBuilder {
     }
 
     private getLimitSQL() {
-        const { limit } = this.args.compiledMetricQuery;
-        return limit !== undefined ? `LIMIT ${limit}` : undefined;
+        const { limit, offset } = this.args.compiledMetricQuery;
+        if (limit === undefined) {
+            return undefined;
+        }
+        if (offset !== undefined && offset > 0) {
+            return `LIMIT ${limit} OFFSET ${offset}`;
+        }
+        return `LIMIT ${limit}`;
     }
 
     private getBaseTableFromSQL() {

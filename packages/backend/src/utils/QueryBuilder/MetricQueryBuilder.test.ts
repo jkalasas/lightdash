@@ -813,6 +813,46 @@ describe('getIntervalSyntax', () => {
 });
 
 describe('Query builder', () => {
+    test('Should append OFFSET when compiled metric query has offset', () => {
+        const { query } = buildQuery({
+            explore: EXPLORE,
+            compiledMetricQuery: {
+                ...METRIC_QUERY,
+                offset: 20,
+            },
+            warehouseSqlBuilder: warehouseClientMock,
+            intrinsicUserAttributes: INTRINSIC_USER_ATTRIBUTES,
+            timezone: QUERY_BUILDER_UTC_TIMEZONE,
+        });
+
+        expect(query).toMatch(/LIMIT 10 OFFSET 20\s*$/);
+    });
+
+    test('Should not append OFFSET when offset is 0 or omitted', () => {
+        const withoutOffset = buildQuery({
+            explore: EXPLORE,
+            compiledMetricQuery: METRIC_QUERY,
+            warehouseSqlBuilder: warehouseClientMock,
+            intrinsicUserAttributes: INTRINSIC_USER_ATTRIBUTES,
+            timezone: QUERY_BUILDER_UTC_TIMEZONE,
+        }).query;
+        const zeroOffset = buildQuery({
+            explore: EXPLORE,
+            compiledMetricQuery: {
+                ...METRIC_QUERY,
+                offset: 0,
+            },
+            warehouseSqlBuilder: warehouseClientMock,
+            intrinsicUserAttributes: INTRINSIC_USER_ATTRIBUTES,
+            timezone: QUERY_BUILDER_UTC_TIMEZONE,
+        }).query;
+
+        expect(withoutOffset).toMatch(/LIMIT 10\s*$/);
+        expect(withoutOffset).not.toMatch(/OFFSET/);
+        expect(zeroOffset).toMatch(/LIMIT 10\s*$/);
+        expect(zeroOffset).not.toMatch(/OFFSET/);
+    });
+
     test('Should reuse non-time filters for PoP metrics while shifting the comparison period', () => {
         const { query } = buildQuery({
             explore: POP_TEST_EXPLORE,

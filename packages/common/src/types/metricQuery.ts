@@ -185,6 +185,8 @@ export type MetricQuery = {
     sorts: SortField[];
     /** Maximum number of rows to return */
     limit: number;
+    /** Number of rows to skip before applying limit */
+    offset?: number;
     /** Custom calculations to perform on query results */
     tableCalculations: TableCalculation[];
     /** Custom metrics defined inline (ad-hoc metrics not in the dbt model) */
@@ -254,6 +256,7 @@ export type MetricQueryResponse = {
     filters: FiltersResponse;
     sorts: SortField[]; // Sorts for the data
     limit: number; // Max number of rows to return from query
+    offset?: number; // Number of rows to skip before applying limit
     tableCalculations: TableCalculation[]; // calculations to append to results
     additionalMetrics?: AdditionalMetric[]; // existing metric type
     customDimensions?: CustomDimension[];
@@ -313,6 +316,7 @@ export type MetricQueryRequest = {
     };
     sorts: SortField[]; // Sorts for the data
     limit: number; // Max number of rows to return from query
+    offset?: number; // Number of rows to skip before applying limit
     tableCalculations: TableCalculation[]; // calculations to append to results
     additionalMetrics?: AdditionalMetric[]; // existing metric type
     csvLimit?: number;

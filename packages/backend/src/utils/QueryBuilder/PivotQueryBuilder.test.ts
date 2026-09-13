@@ -76,6 +76,34 @@ describe('PivotQueryBuilder', () => {
             expect(result).toContain('LIMIT 500');
         });
 
+        test('Should append OFFSET on simple aggregation when offset is set', () => {
+            const pivotConfiguration = {
+                indexColumn: [{ reference: 'date', type: VizIndexType.TIME }],
+                valuesColumns: [
+                    {
+                        reference: 'event_id',
+                        aggregation: VizAggregationOptions.SUM,
+                    },
+                ],
+                groupByColumns: undefined,
+                sortBy: [{ reference: 'date', direction: SortByDirection.ASC }],
+            };
+
+            const builder = new PivotQueryBuilder(
+                baseSql,
+                pivotConfiguration,
+                mockWarehouseSqlBuilder,
+                10,
+                undefined,
+                20,
+            );
+
+            const result = builder.toSql();
+
+            expect(result).toContain('LIMIT 10 OFFSET 20');
+            expect(result).not.toContain('LIMIT 10 OFFSET 20 OFFSET');
+        });
+
         test('Should build query with multiple index columns', () => {
             const pivotConfiguration = {
                 indexColumn: [
@@ -202,6 +230,36 @@ describe('PivotQueryBuilder', () => {
                 finalSelect.indexOf(' FROM ('),
             );
             expect(finalProjection).not.toContain('__grp_rn');
+        });
+
+        test('Should window pivot rows with OFFSET when offset is set', () => {
+            const pivotConfiguration = {
+                indexColumn: [{ reference: 'date', type: VizIndexType.TIME }],
+                valuesColumns: [
+                    {
+                        reference: 'event_id',
+                        aggregation: VizAggregationOptions.SUM,
+                    },
+                ],
+                groupByColumns: [{ reference: 'event_type' }],
+                sortBy: [{ reference: 'date', direction: SortByDirection.ASC }],
+            };
+
+            const builder = new PivotQueryBuilder(
+                baseSql,
+                pivotConfiguration,
+                mockWarehouseSqlBuilder,
+                10,
+                undefined,
+                20,
+            );
+
+            const result = builder.toSql({ columnLimit: 100 });
+
+            expect(result).toContain(
+                'WHERE "row_index" > 20 AND "row_index" <= 30',
+            );
+            expect(result).not.toContain('WHERE "row_index" <= 10');
         });
 
         test.each([SupportedDbtAdapter.TRINO, SupportedDbtAdapter.ATHENA])(
