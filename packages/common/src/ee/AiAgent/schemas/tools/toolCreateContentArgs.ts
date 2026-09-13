@@ -13,10 +13,11 @@ type RequiredMetricQueryKeys = keyof Omit<
     | 'timezone'
     | 'pivotDimensions'
     | 'metadata'
+    | 'offset'
 >;
 
 const TOOL_CHART_AS_CODE_METRIC_QUERY_DESCRIPTION =
-    'Chart-as-code metricQuery object. Required fields: exploreName, dimensions, metrics, filters, sorts, limit, tableCalculations. Optional passthrough fields: additionalMetrics, customDimensions, metricOverrides, dimensionOverrides, timezone, pivotDimensions, metadata. Every dimension in dimensions must appear in exactly one of: layout.xField, layout.yField, or pivotConfig.columns.';
+    'Chart-as-code metricQuery object. Required fields: exploreName, dimensions, metrics, filters, sorts, limit, tableCalculations. Optional passthrough fields: additionalMetrics, customDimensions, metricOverrides, dimensionOverrides, timezone, pivotDimensions, metadata, offset. Every dimension in dimensions must appear in exactly one of: layout.xField, layout.yField, or pivotConfig.columns.';
 
 const chartAsCodeMetricQueryShape = {
     exploreName: z.unknown(),
