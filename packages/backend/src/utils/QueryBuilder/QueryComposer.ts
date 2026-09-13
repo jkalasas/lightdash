@@ -23,7 +23,7 @@ import { wrapSentryTransactionSync } from '../../utils';
 import { updateExploreWithDateZoom } from './dateZoom';
 import { CompiledQuery, MetricQueryBuilder } from './MetricQueryBuilder';
 import { PivotQueryBuilder } from './PivotQueryBuilder';
-import { TotalConfiguration } from './utils';
+import { applyLimitToSqlQuery, TotalConfiguration } from './utils';
 
 export type { TotalConfiguration } from './utils';
 
@@ -334,9 +334,26 @@ export class QueryComposer {
     getSql({ columnLimit }: { columnLimit: number }): string {
         const compiledQuery = this.compile();
         const pivotConfiguration = this.getPivotConfiguration();
+        const countOnly =
+            this.getMetricQuery().countOnly === true &&
+            !this.definition.asCteBody;
 
         if (!pivotConfiguration) {
-            return this.finalizeSql(compiledQuery.query, false);
+            if (!countOnly) {
+                return this.finalizeSql(compiledQuery.query, false);
+            }
+
+            const unlimited = applyLimitToSqlQuery({
+                sqlQuery: compiledQuery.query,
+                limit: null,
+            }).replace(/;\s*$/, '');
+
+            return this.finalizeSql(
+                `SELECT COUNT(*) AS total_rows FROM (
+${unlimited}
+) AS count_query`,
+                false,
+            );
         }
 
         const pivotQueryBuilder = new PivotQueryBuilder(
@@ -347,6 +364,11 @@ export class QueryComposer {
             this.context.pivotItemsMap ?? compiledQuery.fields,
             this.getMetricQuery().offset,
         );
+
+        if (countOnly) {
+            return this.finalizeSql(pivotQueryBuilder.toCountSql(), true);
+        }
+
         return this.finalizeSql(pivotQueryBuilder.toSql({ columnLimit }), true);
     }
 
