@@ -124,7 +124,7 @@ const periodComparisonCustomMetricSchema = z.object({
     timeDimensionId: z
         .string()
         .describe(
-            'Field ID of the time dimension to anchor the shift on. Must be present in queryConfig.dimensions. Format: "table_column_granularity" — the suffix encodes the bucket (e.g. "..._month" → MONTH bucket).',
+            'Field ID of the time dimension to anchor the shift on. Must be a time-interval dimension that exists in the explore. Does NOT need to be present in queryConfig.dimensions — omit it to compare without grouping by date. Format: "table_column_granularity" — the suffix encodes the bucket (e.g. "..._month" → MONTH bucket).',
         ),
     granularity: popGranularityEnum.describe(
         "Bucket unit for the offset. Must equal the bucket encoded in timeDimensionId's suffix.",
@@ -242,10 +242,10 @@ export const customMetricsSchema = z
     "month-over-month", "vs last quarter", "compare to previous period",
     "N periods ago".
 
-For period comparisons, every successful chart has three things:
-- The time dimension in queryConfig.dimensions
+For period comparisons, every successful chart has:
 - The base metric in queryConfig.metrics
-- A customMetric of kind "periodComparison" pointing at that base metric and time dimension
+- A customMetric of kind "periodComparison" pointing at that base metric and a time dimension that exists in the explore
+- Optionally the time dimension in queryConfig.dimensions if you want results grouped by date. It is not required.
 
 The server generates the comparison column automatically and appends it next to the base metric. Do NOT add the comparison column id to queryConfig.metrics yourself.
 
@@ -264,5 +264,10 @@ Example A — "Average customer age sorted descending"
 Example B — "Revenue by month with year-over-year comparison"
   queryConfig.dimensions: ["orders_order_date_month"]
   queryConfig.metrics: ["orders_revenue"]
-  customMetrics: [{ kind: "periodComparison", baseMetricId: "orders_revenue", timeDimensionId: "orders_order_date_month", granularity: "MONTH", periodOffset: 12 }]`,
+  customMetrics: [{ kind: "periodComparison", baseMetricId: "orders_revenue", timeDimensionId: "orders_order_date_month", granularity: "MONTH", periodOffset: 12 }]
+
+Example C — "Total revenue vs previous year" (no date grouping)
+  queryConfig.dimensions: []
+  queryConfig.metrics: ["orders_revenue"]
+  customMetrics: [{ kind: "periodComparison", baseMetricId: "orders_revenue", timeDimensionId: "orders_order_date_year", granularity: "YEAR", periodOffset: 1 }]`,
     );

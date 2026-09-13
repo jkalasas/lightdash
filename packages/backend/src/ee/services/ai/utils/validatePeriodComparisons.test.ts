@@ -165,7 +165,7 @@ describe('validatePeriodComparisons', () => {
         ).not.toThrow();
     });
 
-    it('rejects when timeDimensionId is not in selected dimensions', () => {
+    it('passes when timeDimensionId is not in selected dimensions', () => {
         expect(() =>
             validatePeriodComparisons(
                 baseExplore,
@@ -174,7 +174,36 @@ describe('validatePeriodComparisons', () => {
                 ['orders_revenue'],
                 null,
             ),
-        ).toThrow(/orders_created_at_month/);
+        ).not.toThrow();
+    });
+
+    it('passes when no dimensions are selected', () => {
+        expect(() =>
+            validatePeriodComparisons(
+                baseExplore,
+                [validPc],
+                [],
+                ['orders_revenue'],
+                null,
+            ),
+        ).not.toThrow();
+    });
+
+    it('rejects when timeDimensionId is not a dimension in the explore', () => {
+        expect(() =>
+            validatePeriodComparisons(
+                baseExplore,
+                [
+                    {
+                        ...validPc,
+                        timeDimensionId: 'orders_does_not_exist',
+                    },
+                ],
+                [],
+                ['orders_revenue'],
+                null,
+            ),
+        ).toThrow(/not a dimension in the explore/);
     });
 
     it('rejects when timeDimensionId is not a time-interval dimension', () => {

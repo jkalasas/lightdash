@@ -1,7 +1,12 @@
 import { v4 as uuidv4 } from 'uuid';
 import { getItemId } from '../utils/item';
 import { timeFrameConfigs } from '../utils/timeFrames';
-import { type Metric } from './field';
+import {
+    isDimension,
+    type Dimension,
+    type ItemsMap,
+    type Metric,
+} from './field';
 import {
     isPeriodOverPeriodAdditionalMetric,
     type AdditionalMetric,
@@ -60,6 +65,37 @@ export const periodOverPeriodGranularityLabels: Record<TimeFrames, string> = {
 export const isSupportedPeriodOverPeriodGranularity = (
     granularity: TimeFrames,
 ) => validPeriodOverPeriodGranularities.includes(granularity);
+
+export const isPopTimeDimension = (
+    item: ItemsMap[string] | undefined,
+    { allowHidden = false }: { allowHidden?: boolean } = {},
+): item is Dimension =>
+    isDimension(item) &&
+    !!item.timeInterval &&
+    isSupportedPeriodOverPeriodGranularity(item.timeInterval) &&
+    (allowHidden || !item.hidden);
+
+export const getPopTimeDimensionCandidates = ({
+    itemsMap,
+    selectedDimensionIds,
+}: {
+    itemsMap: ItemsMap;
+    selectedDimensionIds: string[];
+}): { dimensions: Dimension[]; fromSelected: boolean } => {
+    const selected = selectedDimensionIds
+        .map((id) => itemsMap[id])
+        .filter((item): item is Dimension =>
+            isPopTimeDimension(item, { allowHidden: true }),
+        );
+    if (selected.length > 0) {
+        return { dimensions: selected, fromSelected: true };
+    }
+
+    const exploreWide = Object.values(itemsMap)
+        .filter((item): item is Dimension => isPopTimeDimension(item))
+        .sort((a, b) => (a.label || a.name).localeCompare(b.label || b.name));
+    return { dimensions: exploreWide, fromSelected: false };
+};
 
 export const hashStringToBase36 = (input: string): string => {
     // Deterministic, non-cryptographic hash (no deps).

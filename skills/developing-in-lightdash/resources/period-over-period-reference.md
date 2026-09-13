@@ -269,7 +269,7 @@ additionalMetrics:
 
 ## Important Notes
 
-- The time dimension in `dimensions` must match the grain referenced by `timeDimensionId`. For year-over-year, use `_year` suffix; for month-over-month, use `_month`.
+- `timeDimensionId` does not have to be in `dimensions`. If it is selected, its grain must match `timeDimensionId` (year-over-year uses the `_year` suffix; month-over-month uses `_month`).
 - Countries/categories that only exist in one period will show `∅` (null) for the comparison column — this is expected behavior.
 - PoP metrics must be listed in both `additionalMetrics` and `metrics` arrays.
 - YAML keys must be sorted alphabetically for `lightdash upload` to accept the file.

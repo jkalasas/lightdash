@@ -3,11 +3,11 @@ import {
     getGranularityRank,
     getItemId,
     getPopPeriodLabel,
+    getPopTimeDimensionCandidates,
     hasPeriodOverPeriodAdditionalMetricWithConfig,
     isDimension,
     isSupportedPeriodOverPeriodGranularity,
     timeFrameConfigs,
-    type Dimension,
     type ItemsMap,
     type Metric,
     type TimeFrames,
@@ -35,34 +35,29 @@ const PeriodOverPeriodComparisonModalContent: FC<{
 
     const selectedDimensions = useExplorerSelector(selectDimensions);
 
-    const allTimeDimensions = useMemo(() => {
-        if (!itemsMap || !selectedDimensions) return [];
+    const { dimensions: allTimeDimensions, fromSelected } = useMemo(
+        () =>
+            getPopTimeDimensionCandidates({
+                itemsMap,
+                selectedDimensionIds: selectedDimensions ?? [],
+            }),
+        [itemsMap, selectedDimensions],
+    );
 
-        return selectedDimensions
-            .map((dimId) => itemsMap[dimId])
-            .filter(
-                (item): item is Dimension =>
-                    isDimension(item) &&
-                    !!item.timeInterval &&
-                    isSupportedPeriodOverPeriodGranularity(item.timeInterval),
-            );
-    }, [itemsMap, selectedDimensions]);
-
-    // Find the finest granularity among all selected time dimensions
     const finestRank = useMemo(() => {
-        if (allTimeDimensions.length === 0) return Infinity;
+        if (!fromSelected || allTimeDimensions.length === 0) return Infinity;
         return Math.min(
             ...allTimeDimensions.map((dim) =>
                 getGranularityRank(dim.timeInterval as TimeFrames),
             ),
         );
-    }, [allTimeDimensions]);
+    }, [allTimeDimensions, fromSelected]);
 
     const selectData = useMemo(
         () =>
             allTimeDimensions.map((dim) => {
                 const rank = getGranularityRank(dim.timeInterval as TimeFrames);
-                const isCoarser = rank > finestRank;
+                const isCoarser = fromSelected && rank > finestRank;
 
                 return {
                     value: getItemId(dim),
@@ -70,7 +65,7 @@ const PeriodOverPeriodComparisonModalContent: FC<{
                     disabled: isCoarser,
                 };
             }),
-        [allTimeDimensions, finestRank],
+        [allTimeDimensions, finestRank, fromSelected],
     );
 
     const renderSelectOption: React.ComponentProps<
@@ -212,7 +207,7 @@ const PeriodOverPeriodComparisonModalContent: FC<{
                     placeholder={
                         canConfigure
                             ? 'Select time dimension'
-                            : 'Add a time dimension to enable comparison'
+                            : 'No time dimensions available'
                     }
                     data={selectData}
                     value={selectedTimeDimensionId}
@@ -222,6 +217,15 @@ const PeriodOverPeriodComparisonModalContent: FC<{
                     searchable
                     clearable
                 />
+
+                {timeDimensionId &&
+                !selectedDimensions.includes(timeDimensionId) ? (
+                    <Callout variant="info">
+                        This date won't be added to your results. The comparison
+                        window comes from your date filters, or the full range
+                        if you have none.
+                    </Callout>
+                ) : null}
 
                 <Group gap="xs" align="center">
                     <NumberInput
