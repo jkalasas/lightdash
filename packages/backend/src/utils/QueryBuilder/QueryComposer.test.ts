@@ -93,6 +93,26 @@ describe('QueryComposer', () => {
         expect(composer.getSql({ columnLimit: 100 })).toBe(compiled.query);
     });
 
+    it('wraps unlimited SQL in COUNT(*) when countOnly is set', () => {
+        const composer = new QueryComposer(
+            {
+                metricQuery: {
+                    ...METRIC_QUERY,
+                    countOnly: true,
+                    offset: 20,
+                },
+            },
+            CONTEXT,
+        );
+
+        const sql = composer.getSql({ columnLimit: 100 });
+
+        expect(sql).toMatch(/SELECT COUNT\(\*\) AS total_rows FROM \(/);
+        expect(sql).toContain('AS count_query');
+        expect(sql).not.toMatch(/OFFSET/);
+        expect(sql).not.toMatch(/LIMIT\s+10/);
+    });
+
     it('wraps the base query with the pivot query when a pivot configuration is set', () => {
         const composer = new QueryComposer(
             {

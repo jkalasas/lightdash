@@ -187,6 +187,8 @@ export type MetricQuery = {
     limit: number;
     /** Number of rows to skip before applying limit */
     offset?: number;
+    /** When true, compile SQL as SELECT COUNT(*) of the unlimited query */
+    countOnly?: boolean;
     /** Custom calculations to perform on query results */
     tableCalculations: TableCalculation[];
     /** Custom metrics defined inline (ad-hoc metrics not in the dbt model) */
@@ -317,6 +319,7 @@ export type MetricQueryRequest = {
     sorts: SortField[]; // Sorts for the data
     limit: number; // Max number of rows to return from query
     offset?: number; // Number of rows to skip before applying limit
+    countOnly?: boolean; // Compile as COUNT(*) of the unlimited query
     tableCalculations: TableCalculation[]; // calculations to append to results
     additionalMetrics?: AdditionalMetric[]; // existing metric type
     csvLimit?: number;

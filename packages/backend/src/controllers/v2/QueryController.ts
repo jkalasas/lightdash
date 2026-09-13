@@ -191,6 +191,7 @@ export class QueryController extends BaseController {
             sorts: body.query.sorts,
             limit: body.query.limit,
             offset: body.query.offset,
+            countOnly: body.query.countOnly,
             tableCalculations: body.query.tableCalculations,
             additionalMetrics: body.query.additionalMetrics,
             customDimensions: body.query.customDimensions,

@@ -22,7 +22,7 @@ import { wrapSentryTransactionSync } from '../../utils';
 import { updateExploreWithDateZoom } from './dateZoom';
 import { CompiledQuery, MetricQueryBuilder } from './MetricQueryBuilder';
 import { PivotQueryBuilder } from './PivotQueryBuilder';
-import { TotalConfiguration } from './utils';
+import { applyLimitToSqlQuery, TotalConfiguration } from './utils';
 
 export type { TotalConfiguration } from './utils';
 
@@ -325,9 +325,21 @@ export class QueryComposer {
     getSql({ columnLimit }: { columnLimit: number }): string {
         const compiledQuery = this.compile();
         const pivotConfiguration = this.getPivotConfiguration();
+        const countOnly = this.getMetricQuery().countOnly === true;
 
         if (!pivotConfiguration) {
-            return compiledQuery.query;
+            if (!countOnly) {
+                return compiledQuery.query;
+            }
+
+            const unlimited = applyLimitToSqlQuery({
+                sqlQuery: compiledQuery.query,
+                limit: null,
+            }).replace(/;\s*$/, '');
+
+            return `SELECT COUNT(*) AS total_rows FROM (
+${unlimited}
+) AS count_query`;
         }
 
         const pivotQueryBuilder = new PivotQueryBuilder(
@@ -338,6 +350,11 @@ export class QueryComposer {
             this.context.pivotItemsMap ?? compiledQuery.fields,
             this.getMetricQuery().offset,
         );
+
+        if (countOnly) {
+            return pivotQueryBuilder.toCountSql();
+        }
+
         return pivotQueryBuilder.toSql({ columnLimit });
     }
 }

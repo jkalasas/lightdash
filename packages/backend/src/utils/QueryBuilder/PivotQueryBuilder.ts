@@ -2155,6 +2155,53 @@ export class PivotQueryBuilder {
         return `LIMIT ${rowLimit}`;
     }
 
+    toCountSql(): string {
+        const indexColumns = normalizeIndexColumns(
+            this.pivotConfiguration.indexColumn,
+        );
+        const {
+            valuesColumns: displayColumns,
+            groupByColumns,
+            sortOnlyColumns,
+            sortOnlyDimensions,
+            passthroughDimensions,
+        } = this.pivotConfiguration;
+        const valuesColumns = sortOnlyColumns?.length
+            ? [...displayColumns, ...sortOnlyColumns]
+            : displayColumns;
+        const q = this.warehouseSqlBuilder.getFieldQuoteChar();
+        const ctes = [
+            `original_query AS (${this.getBaseSql()})`,
+            `group_by_query AS (${this.getGroupByQuerySQL(
+                indexColumns,
+                valuesColumns,
+                groupByColumns,
+                sortOnlyDimensions,
+                passthroughDimensions,
+            )})`,
+        ];
+
+        if (
+            groupByColumns &&
+            groupByColumns.length > 0 &&
+            indexColumns.length > 0
+        ) {
+            const distinctCols = indexColumns
+                .map((col) => `${q}${col.reference}${q}`)
+                .join(', ');
+
+            return PivotQueryBuilder.assembleSqlParts([
+                PivotQueryBuilder.buildCtesSQL(ctes),
+                `SELECT COUNT(*) AS total_rows FROM (SELECT DISTINCT ${distinctCols} FROM group_by_query) AS count_query`,
+            ]);
+        }
+
+        return PivotQueryBuilder.assembleSqlParts([
+            PivotQueryBuilder.buildCtesSQL(ctes),
+            `SELECT COUNT(*) AS total_rows FROM group_by_query`,
+        ]);
+    }
+
     private getBaseSql(): string {
         // Remove limit and trailing semicolon from base SQL
         return applyLimitToSqlQuery({

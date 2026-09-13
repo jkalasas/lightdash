@@ -104,6 +104,37 @@ describe('PivotQueryBuilder', () => {
             expect(result).not.toContain('LIMIT 10 OFFSET 20 OFFSET');
         });
 
+        test('Should count rows from group_by_query without LIMIT', () => {
+            const pivotConfiguration = {
+                indexColumn: [{ reference: 'date', type: VizIndexType.TIME }],
+                valuesColumns: [
+                    {
+                        reference: 'event_id',
+                        aggregation: VizAggregationOptions.SUM,
+                    },
+                ],
+                groupByColumns: undefined,
+                sortBy: [{ reference: 'date', direction: SortByDirection.ASC }],
+            };
+
+            const builder = new PivotQueryBuilder(
+                `${baseSql} LIMIT 10 OFFSET 20`,
+                pivotConfiguration,
+                mockWarehouseSqlBuilder,
+                10,
+                undefined,
+                20,
+            );
+
+            const result = builder.toCountSql();
+
+            expect(result).toContain(
+                'SELECT COUNT(*) AS total_rows FROM group_by_query',
+            );
+            expect(result).not.toMatch(/LIMIT 10/);
+            expect(result).not.toMatch(/OFFSET 20/);
+        });
+
         test('Should build query with multiple index columns', () => {
             const pivotConfiguration = {
                 indexColumn: [
@@ -260,6 +291,36 @@ describe('PivotQueryBuilder', () => {
                 'WHERE "row_index" > 20 AND "row_index" <= 30',
             );
             expect(result).not.toContain('WHERE "row_index" <= 10');
+        });
+
+        test('Should count distinct index rows for a grouped pivot', () => {
+            const pivotConfiguration = {
+                indexColumn: [{ reference: 'date', type: VizIndexType.TIME }],
+                valuesColumns: [
+                    {
+                        reference: 'event_id',
+                        aggregation: VizAggregationOptions.SUM,
+                    },
+                ],
+                groupByColumns: [{ reference: 'event_type' }],
+                sortBy: [{ reference: 'date', direction: SortByDirection.ASC }],
+            };
+
+            const builder = new PivotQueryBuilder(
+                baseSql,
+                pivotConfiguration,
+                mockWarehouseSqlBuilder,
+                10,
+                undefined,
+                20,
+            );
+
+            const result = builder.toCountSql();
+
+            expect(result).toContain(
+                'SELECT COUNT(*) AS total_rows FROM (SELECT DISTINCT "date" FROM group_by_query) AS count_query',
+            );
+            expect(result).not.toContain('filtered_rows');
         });
 
         test.each([SupportedDbtAdapter.TRINO, SupportedDbtAdapter.ATHENA])(
