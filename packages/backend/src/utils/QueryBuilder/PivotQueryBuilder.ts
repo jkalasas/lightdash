@@ -63,6 +63,8 @@ export class PivotQueryBuilder {
 
     private readonly limit: number | undefined;
 
+    private readonly offset: number;
+
     private readonly warehouseSqlBuilder: WarehouseSqlBuilder;
 
     private readonly itemsMap: ItemsMap;
@@ -83,6 +85,7 @@ export class PivotQueryBuilder {
      * @param warehouseSqlBuilder - Database-specific SQL builder for proper quoting and syntax
      * @param limit - Optional row limit for the result set (defaults to 500)
      * @param itemsMap - Map of field references to field metadata for resolving time intervals
+     * @param offset - Optional number of rows to skip before applying limit
      */
     constructor(
         sql: string,
@@ -90,12 +93,14 @@ export class PivotQueryBuilder {
         warehouseSqlBuilder: WarehouseSqlBuilder,
         limit?: number,
         itemsMap?: ItemsMap,
+        offset?: number,
     ) {
         const script = prepareSqlForWrapping(sql);
         this.sql = script.sql;
         this.scriptPrelude = script.prelude;
         this.pivotConfiguration = pivotConfiguration;
         this.limit = limit;
+        this.offset = offset ?? 0;
         this.warehouseSqlBuilder = warehouseSqlBuilder;
         this.itemsMap = itemsMap ?? {};
         this.pivotTableCalculations = this.identifyPivotTableCalculations();
@@ -2179,9 +2184,7 @@ export class PivotQueryBuilder {
         }
 
         ctes.push(
-            `filtered_rows AS (SELECT * FROM ${pivotTableRef} WHERE ${this.quoteIdentifier(
-                'row_index',
-            )} <= ${rowLimit})`,
+            `filtered_rows AS (SELECT * FROM ${pivotTableRef} WHERE ${this.getRowIndexFilterSql(rowLimit)})`,
         );
 
         // total_columns is the distinct groupBy-combination count (× valuesCount
@@ -2257,8 +2260,24 @@ export class PivotQueryBuilder {
             PivotQueryBuilder.buildCtesSQL(ctes),
             `SELECT * FROM group_by_query${
                 orderBy ? ` ${orderBy}` : ''
-            } LIMIT ${this.limit ?? DEFAULT_PIVOT_ROW_LIMIT}`,
+            } ${this.getLimitOffsetSql()}`,
         ]);
+    }
+
+    private getRowIndexFilterSql(rowLimit: number): string {
+        const rowIndex = this.quoteIdentifier('row_index');
+        if (this.offset > 0) {
+            return `${rowIndex} > ${this.offset} AND ${rowIndex} <= ${this.offset + rowLimit}`;
+        }
+        return `${rowIndex} <= ${rowLimit}`;
+    }
+
+    private getLimitOffsetSql(): string {
+        const rowLimit = this.limit ?? DEFAULT_PIVOT_ROW_LIMIT;
+        if (this.offset > 0) {
+            return `LIMIT ${rowLimit} OFFSET ${this.offset}`;
+        }
+        return `LIMIT ${rowLimit}`;
     }
 
     private getBaseSql(): string {
