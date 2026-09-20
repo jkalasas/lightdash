@@ -1,9 +1,9 @@
 /* eslint-disable prefer-arrow-callback, func-names */
 import * as pg from 'pg';
-import { PassThrough } from 'stream';
 import type { Mock } from 'vitest';
 import {
     PostgresSqlBuilder,
+    postgresStreamConcurrencyForTests,
     PostgresWarehouseClient,
 } from './PostgresWarehouseClient';
 import {
@@ -18,41 +18,34 @@ import {
     expectedWarehouseSchemaWithNaiveTimestamp,
 } from './WarehouseClient.mock';
 
+const isSessionSetupQuery = (sql: string) =>
+    sql.startsWith('SET statement_timeout') || sql.startsWith('SET timezone');
+
+const isVersionQuery = (sql: string) =>
+    sql.toLowerCase().includes('select version()');
+
+const isCatalogQuery = (sql: string) =>
+    sql.toLowerCase().includes('information_schema.columns');
+
 vi.mock('pg', async () => ({
     ...(await vi.importActual<{ default: typeof import('pg') }>('pg')).default,
     Pool: vi.fn(function () {
         return {
-            connect: vi.fn((callback) => {
-                callback(
-                    null,
-                    {
-                        query: vi.fn((arg: unknown) => {
-                            // Session statements (SET statement_timeout / timezone)
-                            // are issued as plain string queries and must return a
-                            // thenable, not a stream.
-                            if (typeof arg === 'string') {
-                                return Promise.resolve({
-                                    rows: [],
-                                    fields: [],
-                                });
-                            }
-                            const mockedStream = new PassThrough();
-                            setTimeout(() => {
-                                mockedStream.emit('data', {
-                                    row: expectedRow,
-                                    fields: queryColumnsMock,
-                                });
-                                mockedStream.end();
-                            }, 100);
-                            return mockedStream;
-                        }),
-                        on: vi.fn(async () => undefined),
-                    },
-                    vi.fn(),
-                );
-            }),
+            connect: vi.fn(async () => ({
+                query: vi.fn(async (sql: string) => {
+                    if (isSessionSetupQuery(sql)) {
+                        return { rows: [], fields: [] };
+                    }
+                    return {
+                        rows: [expectedRow],
+                        fields: queryColumnsMock,
+                    };
+                }),
+                on: vi.fn(),
+                release: vi.fn(),
+            })),
             end: vi.fn(async () => undefined),
-            on: vi.fn(async () => undefined),
+            on: vi.fn(),
         };
     }),
 }));
@@ -69,68 +62,46 @@ describe('PostgresWarehouseClient', () => {
         (pg.Pool as unknown as Mock)
             .mockImplementationOnce(function () {
                 return {
-                    connect: vi.fn((callback) => {
-                        callback(
-                            null,
-                            {
-                                query: vi.fn((arg: unknown) => {
-                                    if (typeof arg === 'string') {
-                                        return Promise.resolve({
-                                            rows: [],
-                                            fields: [],
-                                        });
-                                    }
-                                    const mockedStream = new PassThrough();
-                                    setTimeout(() => {
-                                        mockedStream.emit('data', {
-                                            row: { version: 'PostgreSQL 15.4' },
-                                            fields: [],
-                                        });
-                                        mockedStream.end();
-                                    }, 100);
-                                    return mockedStream;
-                                }),
-                                on: vi.fn(async () => undefined),
-                            },
-                            vi.fn(),
-                        );
-                    }),
+                    connect: vi.fn(async () => ({
+                        query: vi.fn(async (sql: string) => {
+                            if (isSessionSetupQuery(sql)) {
+                                return { rows: [], fields: [] };
+                            }
+                            if (isVersionQuery(sql)) {
+                                return {
+                                    rows: [{ version: 'PostgreSQL 15.4' }],
+                                    fields: [],
+                                };
+                            }
+                            return { rows: [], fields: [] };
+                        }),
+                        on: vi.fn(),
+                        release: vi.fn(),
+                    })),
                     end: vi.fn(async () => undefined),
-                    on: vi.fn(async () => undefined),
+                    on: vi.fn(),
                 };
             })
             .mockImplementationOnce(function () {
                 return {
-                    connect: vi.fn((callback) => {
-                        callback(
-                            null,
-                            {
-                                query: vi.fn((arg: unknown) => {
-                                    if (typeof arg === 'string') {
-                                        return Promise.resolve({
-                                            rows: [],
-                                            fields: [],
-                                        });
-                                    }
-                                    const mockedStream = new PassThrough();
-                                    setTimeout(() => {
-                                        columns.forEach((column) => {
-                                            mockedStream.emit('data', {
-                                                row: column,
-                                                fields: [],
-                                            });
-                                        });
-                                        mockedStream.end();
-                                    }, 100);
-                                    return mockedStream;
-                                }),
-                                on: vi.fn(async () => undefined),
-                            },
-                            vi.fn(),
-                        );
-                    }),
+                    connect: vi.fn(async () => ({
+                        query: vi.fn(async (sql: string) => {
+                            if (isSessionSetupQuery(sql)) {
+                                return { rows: [], fields: [] };
+                            }
+                            if (isCatalogQuery(sql)) {
+                                return {
+                                    rows: columns,
+                                    fields: [],
+                                };
+                            }
+                            return { rows: [], fields: [] };
+                        }),
+                        on: vi.fn(),
+                        release: vi.fn(),
+                    })),
                     end: vi.fn(async () => undefined),
-                    on: vi.fn(async () => undefined),
+                    on: vi.fn(),
                 };
             });
         expect(await warehouse.getCatalog(config)).toEqual(
@@ -278,32 +249,38 @@ describe('PostgresWarehouseClient', () => {
 
 describe('PostgresWarehouseClient statement timeout', () => {
     const mockPoolWithQuery = (queryMock: Mock) => {
+        const releaseMock = vi.fn();
+        const endMock = vi.fn(async () => undefined);
+        const client = {
+            query: queryMock,
+            on: vi.fn(),
+            release: releaseMock,
+        };
         (pg.Pool as unknown as Mock).mockImplementationOnce(function () {
             return {
-                connect: vi.fn((callback) => {
-                    callback(null, { query: queryMock, on: vi.fn() }, vi.fn());
-                }),
-                end: vi.fn(async () => undefined),
+                connect: vi.fn(async () => client),
+                end: endMock,
                 on: vi.fn(),
             };
         });
+        return { releaseMock, endMock, client };
     };
 
     const respondingQueryMock = () =>
-        vi.fn((arg: unknown) => {
-            if (typeof arg === 'string') {
-                return Promise.resolve({ rows: [], fields: [] });
+        vi.fn(async (sql: string) => {
+            if (isSessionSetupQuery(sql)) {
+                return { rows: [], fields: [] };
             }
-            const stream = new PassThrough();
-            setTimeout(() => {
-                stream.emit('data', {
-                    row: expectedRow,
-                    fields: queryColumnsMock,
-                });
-                stream.end();
-            }, 10);
-            return stream;
+            return {
+                rows: [expectedRow],
+                fields: queryColumnsMock,
+            };
         });
+
+    const stringQueriesFrom = (queryMock: Mock) =>
+        queryMock.mock.calls
+            .map((call) => call[0])
+            .filter((arg): arg is string => typeof arg === 'string');
 
     afterEach(() => {
         vi.useRealTimers();
@@ -314,20 +291,10 @@ describe('PostgresWarehouseClient statement timeout', () => {
         mockPoolWithQuery(queryMock);
         const warehouse = new PostgresWarehouseClient(credentials);
         await warehouse.runQuery('select 1');
-        const sessionStatement = queryMock.mock.calls
-            .map((call) => call[0])
-            .find((arg) => typeof arg === 'string');
+        const sessionStatement = stringQueriesFrom(queryMock).find((arg) =>
+            arg.includes('SET statement_timeout'),
+        );
         expect(sessionStatement).toContain('SET statement_timeout = 540000');
-    });
-
-    it('omits the competing pg query_timeout from the pool', async () => {
-        const queryMock = respondingQueryMock();
-        mockPoolWithQuery(queryMock);
-        const warehouse = new PostgresWarehouseClient(credentials);
-        await warehouse.runQuery('select 1');
-
-        const poolConfig = (pg.Pool as unknown as Mock).mock.lastCall?.[0];
-        expect(poolConfig).not.toHaveProperty('query_timeout');
     });
 
     it('honors a configured timeoutSeconds for the statement_timeout', async () => {
@@ -338,31 +305,201 @@ describe('PostgresWarehouseClient statement timeout', () => {
             timeoutSeconds: 120,
         });
         await warehouse.runQuery('select 1');
-        const sessionStatement = queryMock.mock.calls
-            .map((call) => call[0])
-            .find((arg) => typeof arg === 'string');
+        const sessionStatement = stringQueriesFrom(queryMock).find((arg) =>
+            arg.includes('SET statement_timeout'),
+        );
         expect(sessionStatement).toContain('SET statement_timeout = 120000');
+    });
+
+    it('runs a one-shot query without BEGIN/COMMIT and soft-releases on success', async () => {
+        const queryMock = respondingQueryMock();
+        const { releaseMock, endMock } = mockPoolWithQuery(queryMock);
+        const warehouse = new PostgresWarehouseClient(credentials);
+        await warehouse.runQuery('select 1');
+
+        const stringQueries = stringQueriesFrom(queryMock);
+
+        expect(stringQueries[0]).toContain('SET statement_timeout');
+        expect(stringQueries).toContain('select 1');
+        expect(stringQueries).not.toContain('BEGIN');
+        expect(stringQueries).not.toContain('COMMIT');
+        expect(stringQueries).not.toContain('ROLLBACK');
+
+        expect(releaseMock).toHaveBeenCalledTimes(1);
+        expect(releaseMock.mock.calls[0]).toEqual([]);
+        expect(endMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('discards the client when the one-shot query fails', async () => {
+        const queryMock = vi.fn(async (sql: string) => {
+            if (isSessionSetupQuery(sql)) {
+                return { rows: [], fields: [] };
+            }
+            throw new Error('relation "missing" does not exist');
+        });
+        const { releaseMock, endMock } = mockPoolWithQuery(queryMock);
+        const warehouse = new PostgresWarehouseClient(credentials);
+
+        await expect(warehouse.runQuery('select 1')).rejects.toThrow(
+            'relation "missing" does not exist',
+        );
+
+        const stringQueries = stringQueriesFrom(queryMock);
+        expect(stringQueries).not.toContain('BEGIN');
+        expect(stringQueries).not.toContain('ROLLBACK');
+        expect(stringQueries).not.toContain('COMMIT');
+
+        expect(releaseMock).toHaveBeenCalledTimes(1);
+        expect(releaseMock.mock.calls[0][0]).toBeInstanceOf(Error);
+        expect(releaseMock.mock.calls[0][0].message).toContain(
+            'discarding client',
+        );
+        expect(endMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('destroys the client without issuing ROLLBACK when the query fails', async () => {
+        const queryMock = vi.fn(async (sql: string) => {
+            if (isSessionSetupQuery(sql)) {
+                return { rows: [], fields: [] };
+            }
+            throw new Error('query failed');
+        });
+        const client = {
+            query: queryMock,
+            on: vi.fn(),
+            release: vi.fn(),
+            connection: {
+                stream: {
+                    destroyed: false,
+                    destroy: vi.fn(
+                        function destroy(this: { destroyed: boolean }) {
+                            this.destroyed = true;
+                        },
+                    ),
+                },
+            },
+        };
+        Reflect.set(client, '_queryable', true);
+        const endMock = vi.fn(async () => undefined);
+        (pg.Pool as unknown as Mock).mockImplementationOnce(function () {
+            return {
+                connect: vi.fn(async () => client),
+                end: endMock,
+                on: vi.fn(),
+            };
+        });
+        const warehouse = new PostgresWarehouseClient(credentials);
+
+        await expect(warehouse.runQuery('select 1')).rejects.toThrow(
+            'query failed',
+        );
+
+        expect(stringQueriesFrom(queryMock)).not.toContain('ROLLBACK');
+        expect(client.connection.stream.destroy).toHaveBeenCalled();
+        expect(Reflect.get(client, '_queryable')).toBe(false);
+        expect(client.release).toHaveBeenCalledTimes(1);
+        expect(client.release.mock.calls[0][0]).toBeInstanceOf(Error);
+        expect(endMock).toHaveBeenCalledTimes(1);
     });
 
     it('rejects with a timeout error when a query stalls past the client backstop', async () => {
         vi.useFakeTimers();
-        const queryMock = vi.fn((arg: unknown) => {
-            if (typeof arg === 'string') {
+        const queryMock = vi.fn((sql: string) => {
+            if (isSessionSetupQuery(sql)) {
                 return Promise.resolve({ rows: [], fields: [] });
             }
-            // A stream that never emits or ends — simulates a stalled cursor.
-            return new PassThrough();
+            return new Promise(() => {});
+        });
+        const { releaseMock, endMock } = mockPoolWithQuery(queryMock);
+        const warehouse = new PostgresWarehouseClient(credentials);
+        const resultPromise = warehouse.runQuery('select pg_sleep(9999)');
+        await Promise.all([
+            expect(resultPromise).rejects.toThrow('Query timed out after 570s'),
+            vi.advanceTimersByTimeAsync(570 * 1000 + 1000),
+        ]);
+
+        expect(stringQueriesFrom(queryMock)).not.toContain('ROLLBACK');
+        expect(releaseMock).toHaveBeenCalledTimes(1);
+        expect(releaseMock.mock.calls[0][0]).toBeInstanceOf(Error);
+        expect(endMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('invokes the stream callback in chunks for multi-row results', async () => {
+        const rows = Array.from({ length: 1200 }, (_, i) => ({
+            ...expectedRow,
+            id: i,
+        }));
+        const queryMock = vi.fn(async (sql: string) => {
+            if (isSessionSetupQuery(sql)) {
+                return { rows: [], fields: [] };
+            }
+            return { rows, fields: queryColumnsMock };
         });
         mockPoolWithQuery(queryMock);
         const warehouse = new PostgresWarehouseClient(credentials);
-        const resultPromise = warehouse.runQuery('select pg_sleep(9999)');
-        // Attach the rejection handler before advancing the clock so the
-        // rejection is never momentarily unhandled.
+
+        const callbackSizes: number[] = [];
+        await warehouse.streamQuery(
+            'select * from big',
+            ({ rows: chunk }) => {
+                callbackSizes.push(chunk.length);
+            },
+            {},
+        );
+
+        expect(callbackSizes).toEqual([500, 500, 200]);
+    });
+});
+
+describe('PostgresWarehouseClient concurrency', () => {
+    afterEach(() => {
+        postgresStreamConcurrencyForTests.reset();
+        vi.useRealTimers();
+    });
+
+    it('queues streams so concurrent open pools never exceed the limit', async () => {
+        postgresStreamConcurrencyForTests.setLimit(1);
+
+        let inFlightPools = 0;
+        let maxInFlightPools = 0;
+
+        (pg.Pool as unknown as Mock).mockImplementation(function () {
+            inFlightPools += 1;
+            maxInFlightPools = Math.max(maxInFlightPools, inFlightPools);
+            return {
+                connect: vi.fn(async () => ({
+                    query: vi.fn(async (sql: string) => {
+                        if (isSessionSetupQuery(sql)) {
+                            return { rows: [], fields: [] };
+                        }
+                        await new Promise((resolve) => {
+                            setTimeout(resolve, 30);
+                        });
+                        return {
+                            rows: [expectedRow],
+                            fields: queryColumnsMock,
+                        };
+                    }),
+                    on: vi.fn(),
+                    release: vi.fn(),
+                })),
+                end: vi.fn(async () => {
+                    inFlightPools -= 1;
+                }),
+                on: vi.fn(),
+            };
+        });
+
+        const warehouse = new PostgresWarehouseClient(credentials);
         await Promise.all([
-            expect(resultPromise).rejects.toThrow('Query timed out after 570s'),
-            // 9-minute statement_timeout + 30s client buffer = 570s
-            vi.advanceTimersByTimeAsync(570 * 1000 + 1000),
+            warehouse.runQuery('select 1'),
+            warehouse.runQuery('select 2'),
+            warehouse.runQuery('select 3'),
         ]);
+
+        expect(maxInFlightPools).toBe(1);
+        expect(postgresStreamConcurrencyForTests.getActiveCount()).toBe(0);
+        expect(postgresStreamConcurrencyForTests.getWaitingCount()).toBe(0);
     });
 });
 
@@ -392,12 +529,10 @@ describe('PostgresSqlBuilder escaping', () => {
     });
 
     test('Should handle SQL injection attempts', () => {
-        // Test with a typical SQL injection pattern
         const maliciousInput = "'; DROP TABLE users; --";
         const escaped = postgresSqlBuilder.escapeString(maliciousInput);
         expect(escaped).toBe("''; DROP TABLE users; ");
 
-        // Test with another common SQL injection pattern
         const anotherMaliciousInput = "' OR '1'='1";
         const anotherEscaped = postgresSqlBuilder.escapeString(
             anotherMaliciousInput,
