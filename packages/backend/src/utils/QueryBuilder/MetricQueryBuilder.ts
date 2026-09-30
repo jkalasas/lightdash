@@ -799,6 +799,34 @@ export class MetricQueryBuilder {
         );
     }
 
+    private getPopBaseDimensionSql(
+        timeDimensionId: string,
+    ): string | undefined {
+        const { warehouseSqlBuilder } = this.args;
+        const popField = this.getPopTimeDimension(timeDimensionId);
+        const baseName = popField.timeIntervalBaseDimensionName;
+        if (!baseName) return undefined;
+        const baseDim =
+            this.originalExploreDimensions[`${popField.table}_${baseName}`] ??
+            this.exploreDimensions[`${popField.table}_${baseName}`];
+        if (!baseDim?.compiledSql) return undefined;
+        return this.getTimezoneAwareDimensionSql(
+            baseDim,
+            warehouseSqlBuilder.getAdapterType(),
+            warehouseSqlBuilder.getStartOfWeek(),
+        );
+    }
+
+    private getPopRangeSql(
+        timeDimensionId: string,
+        truncatedSql: string,
+    ): string {
+        if (this.isPopTimeDimensionSelected(timeDimensionId)) {
+            return truncatedSql;
+        }
+        return this.getPopBaseDimensionSql(timeDimensionId) ?? truncatedSql;
+    }
+
     private getTablesReferencedByDimensionFilters(): string[] {
         const { compiledMetricQuery, warehouseSqlBuilder } = this.args;
         const adapterType = warehouseSqlBuilder.getAdapterType();
@@ -839,7 +867,9 @@ export class MetricQueryBuilder {
         timeDimensionId: string,
     ): string {
         const popField = this.getPopTimeDimension(timeDimensionId);
-        const popFieldSql = this.getPopTimeDimensionSql(timeDimensionId);
+        const popFieldSql =
+            this.getPopBaseDimensionSql(timeDimensionId) ??
+            this.getPopTimeDimensionSql(timeDimensionId);
         const joins = this.getJoinsSQL({
             tablesReferencedInDimensions: [
                 ...(popField.tablesReferences ?? [popField.table]),
@@ -3224,6 +3254,10 @@ export class MetricQueryBuilder {
                         );
                         const popDimensionFilters =
                             this.getPopDimensionsFilterSQL(popFieldId);
+                        const popRangeSql = this.getPopRangeSql(
+                            popFieldId,
+                            popFieldSql,
+                        );
                         const popKeysCteParts = [
                             `SELECT DISTINCT`,
                             [
@@ -3242,7 +3276,7 @@ export class MetricQueryBuilder {
                                 popDimensionFilters,
                                 `WHERE ${getIntervalSyntax(
                                     adapterType,
-                                    popFieldSql,
+                                    popRangeSql,
                                     `${popMinMaxCteName}.min_date`,
                                     '>=',
                                     cfg.periodOffset,
@@ -3250,7 +3284,7 @@ export class MetricQueryBuilder {
                                     false,
                                 )} AND ${getIntervalSyntax(
                                     adapterType,
-                                    popFieldSql,
+                                    popRangeSql,
                                     `${popMinMaxCteName}.max_date`,
                                     '<=',
                                     cfg.periodOffset,
@@ -3441,6 +3475,10 @@ export class MetricQueryBuilder {
                     );
                     const popDimensionFilters =
                         this.getPopDimensionsFilterSQL(popFieldId);
+                    const popRangeSql = this.getPopRangeSql(
+                        popFieldId,
+                        popFieldSql,
+                    );
 
                     /**
                      * CTE for PoP unaffected metrics
@@ -3474,7 +3512,7 @@ export class MetricQueryBuilder {
                             popDimensionFilters,
                             `WHERE ${getIntervalSyntax(
                                 adapterType,
-                                popFieldSql,
+                                popRangeSql,
                                 `${popUnaffectedMinMaxCteName}.min_date`,
                                 '>=',
                                 cfg.periodOffset,
@@ -3482,7 +3520,7 @@ export class MetricQueryBuilder {
                                 false,
                             )} AND ${getIntervalSyntax(
                                 adapterType,
-                                popFieldSql,
+                                popRangeSql,
                                 `${popUnaffectedMinMaxCteName}.max_date`,
                                 '<=',
                                 cfg.periodOffset,
@@ -5433,6 +5471,10 @@ export class MetricQueryBuilder {
                 );
                 const popDimensionFilters =
                     this.getPopDimensionsFilterSQL(popFieldId);
+                const popRangeSql = this.getPopRangeSql(
+                    popFieldId,
+                    popFieldSql,
+                );
 
                 const popMetricSelectsInPopCte = popEntries.map((entry) => {
                     const metric = this.getMetricFromId(entry.baseMetricId);
@@ -5455,7 +5497,7 @@ export class MetricQueryBuilder {
                         popDimensionFilters,
                         `WHERE ${getIntervalSyntax(
                             adapterType,
-                            popFieldSql,
+                            popRangeSql,
                             `${popMinMaxCteName}.min_date`,
                             '>=',
                             cfg.periodOffset,
@@ -5463,7 +5505,7 @@ export class MetricQueryBuilder {
                             false,
                         )} AND ${getIntervalSyntax(
                             adapterType,
-                            popFieldSql,
+                            popRangeSql,
                             `${popMinMaxCteName}.max_date`,
                             '<=',
                             cfg.periodOffset,

@@ -68,6 +68,34 @@ const POP_TEST_EXPLORE: Explore = {
                     timeInterval: TimeFrames.YEAR,
                     timeIntervalBaseDimensionName: 'order_date',
                 },
+                order_date_quarter: {
+                    type: DimensionType.DATE,
+                    name: 'order_date_quarter',
+                    label: 'order_date_quarter',
+                    table: 'orders',
+                    tableLabel: 'orders',
+                    fieldType: FieldType.DIMENSION,
+                    sql: "DATE_TRUNC('QUARTER', ${TABLE}.order_date)",
+                    compiledSql: `DATE_TRUNC('QUARTER', "orders".order_date)`,
+                    tablesReferences: ['orders'],
+                    hidden: false,
+                    timeInterval: TimeFrames.QUARTER,
+                    timeIntervalBaseDimensionName: 'order_date',
+                },
+                order_date_month: {
+                    type: DimensionType.DATE,
+                    name: 'order_date_month',
+                    label: 'order_date_month',
+                    table: 'orders',
+                    tableLabel: 'orders',
+                    fieldType: FieldType.DIMENSION,
+                    sql: "DATE_TRUNC('MONTH', ${TABLE}.order_date)",
+                    compiledSql: `DATE_TRUNC('MONTH', "orders".order_date)`,
+                    tablesReferences: ['orders'],
+                    hidden: false,
+                    timeInterval: TimeFrames.MONTH,
+                    timeIntervalBaseDimensionName: 'order_date',
+                },
                 is_completed: {
                     type: DimensionType.BOOLEAN,
                     name: 'is_completed',
@@ -778,5 +806,107 @@ describe('MetricQueryBuilder snapshot: period-over-period queries', () => {
                 },
             }),
         ).toMatchSnapshot();
+    });
+
+    // Ungrouped PoP with a month filter must anchor the comparison window on
+    // raw base dates, not truncated buckets: truncating a month-long range to
+    // YEAR collapses it to a single value, and the shifted window would then
+    // cover the whole prior year (~12x rows).
+    test('anchors ungrouped year-over-year window on raw base dates', () => {
+        const sql = buildQuery({
+            explore: POP_TEST_EXPLORE,
+            compiledMetricQuery: {
+                ...POP_TEST_METRIC_QUERY,
+                dimensions: [],
+                sorts: [],
+                limit: 1,
+                filters: {
+                    dimensions: {
+                        id: 'root',
+                        and: [
+                            {
+                                id: 'base-month',
+                                target: {
+                                    fieldId: 'orders_order_date_month',
+                                },
+                                operator: FilterOperator.EQUALS,
+                                values: ['2025-08-01'],
+                            },
+                        ],
+                    },
+                },
+            },
+        });
+        expect(sql).toContain('MIN("orders".order_date)');
+        expect(sql).toContain('MAX("orders".order_date)');
+        expect(sql).not.toContain(`DATE_TRUNC('YEAR'`);
+        expect(sql).toContain(`- INTERVAL '1 YEAR'`);
+        expect(sql).toMatchSnapshot();
+    });
+
+    // Same narrow-window invariant for "4 quarters ago": Postgres normalises
+    // the shift to 12 months, and the comparison range must stay month-wide
+    // instead of expanding to a full quarter.
+    test('anchors ungrouped quarter-over-quarter window on raw base dates', () => {
+        const quarterPopName = 'total_order_amount__pop__quarter_4__snapshot';
+        const quarterPopId = `orders_${quarterPopName}`;
+        const sql = buildQuery({
+            explore: POP_TEST_EXPLORE,
+            compiledMetricQuery: {
+                ...POP_TEST_METRIC_QUERY,
+                dimensions: [],
+                sorts: [],
+                limit: 1,
+                metrics: ['orders_total_order_amount', quarterPopId],
+                filters: {
+                    dimensions: {
+                        id: 'root',
+                        and: [
+                            {
+                                id: 'base-month',
+                                target: {
+                                    fieldId: 'orders_order_date_month',
+                                },
+                                operator: FilterOperator.EQUALS,
+                                values: ['2025-08-01'],
+                            },
+                        ],
+                    },
+                },
+                additionalMetrics: [
+                    {
+                        table: 'orders',
+                        name: quarterPopName,
+                        label: 'Total_order_amount 4 quarters ago',
+                        type: MetricType.SUM,
+                        sql: '${TABLE}.amount',
+                        generationType: 'periodOverPeriod' as const,
+                        baseMetricId: 'orders_total_order_amount',
+                        timeDimensionId: 'orders_order_date_quarter',
+                        granularity: TimeFrames.QUARTER,
+                        periodOffset: 4,
+                    },
+                ],
+                compiledAdditionalMetrics: [
+                    {
+                        type: MetricType.SUM,
+                        fieldType: FieldType.METRIC,
+                        table: 'orders',
+                        tableLabel: 'orders',
+                        name: quarterPopName,
+                        label: 'Total_order_amount 4 quarters ago',
+                        sql: '${TABLE}.amount',
+                        compiledSql: 'SUM("orders".amount)',
+                        tablesReferences: ['orders'],
+                        hidden: true,
+                    },
+                ],
+            },
+        });
+        expect(sql).toContain('MIN("orders".order_date)');
+        expect(sql).toContain('MAX("orders".order_date)');
+        expect(sql).not.toContain(`DATE_TRUNC('QUARTER'`);
+        expect(sql).toContain(`- INTERVAL '12 MONTH'`);
+        expect(sql).toMatchSnapshot();
     });
 });

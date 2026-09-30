@@ -1,5 +1,111 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
+exports[`MetricQueryBuilder snapshot: period-over-period queries > anchors ungrouped quarter-over-quarter window on raw base dates 1`] = `
+"WITH
+  base_metrics AS (
+    SELECT
+      SUM("orders".amount) AS "orders_total_order_amount"
+    FROM
+      "postgres"."jaffle"."orders" AS "orders"
+    WHERE
+      (
+        (
+          (DATE_TRUNC('MONTH', "orders".order_date)) = ('2025-08-01')
+        )
+      )
+  ),
+  pop_min_max_quarter_4__001eigbf AS (
+    SELECT
+      MIN("orders".order_date) as min_date,
+      MAX("orders".order_date) as max_date
+    FROM
+      "postgres"."jaffle"."orders" AS "orders"
+    WHERE
+      (
+        (
+          (DATE_TRUNC('MONTH', "orders".order_date)) = ('2025-08-01')
+        )
+      )
+  ),
+  pop_metrics_quarter_4__001eigbf AS (
+    SELECT
+      SUM("orders".amount) AS "orders_total_order_amount__pop__quarter_4__snapshot"
+    FROM
+      "postgres"."jaffle"."orders" AS "orders"
+      LEFT JOIN pop_min_max_quarter_4__001eigbf ON TRUE
+    WHERE
+      "orders".order_date >= pop_min_max_quarter_4__001eigbf.min_date - INTERVAL '12 MONTH'
+      AND "orders".order_date <= pop_min_max_quarter_4__001eigbf.max_date - INTERVAL '12 MONTH'
+  ),
+  metrics AS (
+    SELECT
+      base_metrics.*,
+      pop_metrics_quarter_4__001eigbf."orders_total_order_amount__pop__quarter_4__snapshot" AS "orders_total_order_amount__pop__quarter_4__snapshot"
+    FROM
+      base_metrics
+      CROSS JOIN pop_metrics_quarter_4__001eigbf
+  )
+SELECT
+  *
+FROM
+  metrics
+LIMIT
+  1"
+`;
+
+exports[`MetricQueryBuilder snapshot: period-over-period queries > anchors ungrouped year-over-year window on raw base dates 1`] = `
+"WITH
+  base_metrics AS (
+    SELECT
+      SUM("orders".amount) AS "orders_total_order_amount"
+    FROM
+      "postgres"."jaffle"."orders" AS "orders"
+    WHERE
+      (
+        (
+          (DATE_TRUNC('MONTH', "orders".order_date)) = ('2025-08-01')
+        )
+      )
+  ),
+  pop_min_max_year_1__00jq2hag AS (
+    SELECT
+      MIN("orders".order_date) as min_date,
+      MAX("orders".order_date) as max_date
+    FROM
+      "postgres"."jaffle"."orders" AS "orders"
+    WHERE
+      (
+        (
+          (DATE_TRUNC('MONTH', "orders".order_date)) = ('2025-08-01')
+        )
+      )
+  ),
+  pop_metrics_year_1__00jq2hag AS (
+    SELECT
+      SUM("orders".amount) AS "orders_total_order_amount__pop__year_1__snapshot"
+    FROM
+      "postgres"."jaffle"."orders" AS "orders"
+      LEFT JOIN pop_min_max_year_1__00jq2hag ON TRUE
+    WHERE
+      "orders".order_date >= pop_min_max_year_1__00jq2hag.min_date - INTERVAL '1 YEAR'
+      AND "orders".order_date <= pop_min_max_year_1__00jq2hag.max_date - INTERVAL '1 YEAR'
+  ),
+  metrics AS (
+    SELECT
+      base_metrics.*,
+      pop_metrics_year_1__00jq2hag."orders_total_order_amount__pop__year_1__snapshot" AS "orders_total_order_amount__pop__year_1__snapshot"
+    FROM
+      base_metrics
+      CROSS JOIN pop_metrics_year_1__00jq2hag
+  )
+SELECT
+  *
+FROM
+  metrics
+LIMIT
+  1"
+`;
+
 exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snapshot for a fanout-protected period-over-period query 1`] = `
 "WITH
   cte_keys_table2 AS (
@@ -120,8 +226,8 @@ exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snaps
   ),
   cte_pop_min_max_table2__year_1__00355f4s AS (
     SELECT
-      MIN(DATE_TRUNC('YEAR', "table2".order_date)) as min_date,
-      MAX(DATE_TRUNC('YEAR', "table2".order_date)) as max_date
+      MIN("table2".order_date) as min_date,
+      MAX("table2".order_date) as max_date
     FROM
       "db"."schema"."table1" AS "table1"
       LEFT OUTER JOIN "db"."schema"."table2" AS "table2" ON ("table1".shared) = ("table2".shared)
@@ -142,8 +248,8 @@ exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snaps
       LEFT JOIN cte_pop_min_max_table2__year_1__00355f4s ON TRUE
     WHERE
       ((("table2".is_completed) = true))
-      AND DATE_TRUNC('YEAR', "table2".order_date) >= cte_pop_min_max_table2__year_1__00355f4s.min_date - INTERVAL '1 YEAR'
-      AND DATE_TRUNC('YEAR', "table2".order_date) <= cte_pop_min_max_table2__year_1__00355f4s.max_date - INTERVAL '1 YEAR'
+      AND "table2".order_date >= cte_pop_min_max_table2__year_1__00355f4s.min_date - INTERVAL '1 YEAR'
+      AND "table2".order_date <= cte_pop_min_max_table2__year_1__00355f4s.max_date - INTERVAL '1 YEAR'
   ),
   cte_pop_metrics_table2__year_1__00355f4s AS (
     SELECT
@@ -307,8 +413,8 @@ exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snaps
   ),
   pop_min_max_year_1__00jq2hag AS (
     SELECT
-      MIN(DATE_TRUNC('YEAR', "orders".order_date)) as min_date,
-      MAX(DATE_TRUNC('YEAR', "orders".order_date)) as max_date
+      MIN("orders".order_date) as min_date,
+      MAX("orders".order_date) as max_date
     FROM
       "postgres"."jaffle"."orders" AS "orders"
     WHERE
@@ -327,8 +433,8 @@ exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snaps
       LEFT JOIN pop_min_max_year_1__00jq2hag ON TRUE
     WHERE
       ((("orders".is_completed) = true))
-      AND DATE_TRUNC('YEAR', "orders".order_date) >= pop_min_max_year_1__00jq2hag.min_date - INTERVAL '1 YEAR'
-      AND DATE_TRUNC('YEAR', "orders".order_date) <= pop_min_max_year_1__00jq2hag.max_date - INTERVAL '1 YEAR'
+      AND "orders".order_date >= pop_min_max_year_1__00jq2hag.min_date - INTERVAL '1 YEAR'
+      AND "orders".order_date <= pop_min_max_year_1__00jq2hag.max_date - INTERVAL '1 YEAR'
   ),
   metrics AS (
     SELECT
@@ -422,8 +528,8 @@ exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snaps
   ),
   pop_min_max_year_1__00jq2hag AS (
     SELECT
-      MIN(DATE_TRUNC('YEAR', "orders".order_date)) as min_date,
-      MAX(DATE_TRUNC('YEAR', "orders".order_date)) as max_date
+      MIN("orders".order_date) as min_date,
+      MAX("orders".order_date) as max_date
     FROM
       "postgres"."jaffle"."orders" AS "orders"
     WHERE
@@ -442,8 +548,8 @@ exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snaps
       LEFT JOIN pop_min_max_year_1__00jq2hag ON TRUE
     WHERE
       ((("orders".is_completed) = true))
-      AND DATE_TRUNC('YEAR', "orders".order_date) >= pop_min_max_year_1__00jq2hag.min_date - INTERVAL '1 YEAR'
-      AND DATE_TRUNC('YEAR', "orders".order_date) <= pop_min_max_year_1__00jq2hag.max_date - INTERVAL '1 YEAR'
+      AND "orders".order_date >= pop_min_max_year_1__00jq2hag.min_date - INTERVAL '1 YEAR'
+      AND "orders".order_date <= pop_min_max_year_1__00jq2hag.max_date - INTERVAL '1 YEAR'
   ),
   metrics AS (
     SELECT
@@ -589,8 +695,8 @@ exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snaps
   ),
   pop_min_max_year_1__00jq2hag AS (
     SELECT
-      MIN(DATE_TRUNC('YEAR', "orders".order_date)) as min_date,
-      MAX(DATE_TRUNC('YEAR', "orders".order_date)) as max_date
+      MIN("orders".order_date) as min_date,
+      MAX("orders".order_date) as max_date
     FROM
       "postgres"."jaffle"."orders" AS "orders"
     WHERE
@@ -610,8 +716,8 @@ exports[`MetricQueryBuilder snapshot: period-over-period queries > matches snaps
       LEFT JOIN pop_min_max_year_1__00jq2hag ON TRUE
     WHERE
       ((("orders".is_completed) = true))
-      AND DATE_TRUNC('YEAR', "orders".order_date) >= pop_min_max_year_1__00jq2hag.min_date - INTERVAL '1 YEAR'
-      AND DATE_TRUNC('YEAR', "orders".order_date) <= pop_min_max_year_1__00jq2hag.max_date - INTERVAL '1 YEAR'
+      AND "orders".order_date >= pop_min_max_year_1__00jq2hag.min_date - INTERVAL '1 YEAR'
+      AND "orders".order_date <= pop_min_max_year_1__00jq2hag.max_date - INTERVAL '1 YEAR'
     GROUP BY
       1
   ),
